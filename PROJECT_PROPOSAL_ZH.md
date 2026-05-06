@@ -510,7 +510,7 @@ unknown
 无痕窗口规则优先级最高：
 
 ```text
-无痕窗口 -> 直接 distraction
+无痕窗口 -> 直接 entertainment
 ```
 
 ## 12.3 LLM 使用策略
@@ -771,7 +771,7 @@ Admin time
 Entertainment time
 Gaming time
 Social time
-Incognito/private browsing time
+Entertainment time, including incognito/private browsing
 Attention gap / idle time
 ```
 
@@ -788,7 +788,7 @@ Attention gap / idle time
 - 游戏：3h 20m
 - 娱乐视频：1h 10m
 - 社交聊天：50m
-- 无痕窗口使用：25m
+- 娱乐时间：1h10m
 - 注意力空窗/idle：1h 05m
 
 Deliverable 进展：
@@ -940,12 +940,12 @@ CREATE TABLE daily_reviews (
 
 ```text
 Language: Python
-Backend: FastAPI
+Backend: local background agent; FastAPI optional later
 Database: SQLite
 Desktop Collector: pywin32 / ctypes
 Idle Detection: Windows GetLastInputInfo
 Browser Context: browser extension or local native messaging
-Frontend: Streamlit or simple React
+UI: Terminal-first CLI / optional TUI later
 LLM: OpenAI API or local Ollama
 Storage: local filesystem
 ```
@@ -1101,6 +1101,11 @@ Tauri + React + Rust collector + Python LLM service
 10. Effective time calculation
 11. Daily review generation
 12. LLM planning agent
+13. Background agent
+14. User-level autostart
+15. System tray status
+16. Pause / resume tracking
+17. Agent heartbeat and missing data detection
 ```
 
 ## 暂不需要
@@ -1184,7 +1189,7 @@ MVP 成功标准：
 2. 今天有效生产力时间是多少？
 3. 哪些时间属于核心 productive？
 4. 哪些时间属于 general learning 或 neutral educational？
-5. 游戏、娱乐、社交、无痕窗口分别用了多久？
+5. 游戏、娱乐、社交分别用了多久？无痕/隐私浏览合并计入娱乐。
 6. 今天有哪些 attention gaps？
 7. 哪些 deliverables 有实际推进？
 8. 明天应该优先做什么？
@@ -1194,7 +1199,7 @@ MVP 成功标准：
 
 ```text
 今天 PyCharm 打开了 3h20m，但有效 coding 时间约 1h45m。
-Chrome 使用 2h10m，其中 38m 为 ML 相关学习，25m 为无痕窗口，默认计入 distraction。
+Chrome 使用 2h10m，其中 38m 为 ML 相关学习。
 YouTube 使用 1h30m，其中 VAE lecture 24m 计入 core productive，游戏视频 40m 计入 entertainment，历史科普 26m 计入 neutral educational。
 Steam 使用 3h50m。
 Air Quality deployment doc 有部分推进，但 ML exam review 进度不足。
@@ -1202,6 +1207,1984 @@ Air Quality deployment doc 有部分推进，但 ML exam review 进度不足。
 ```
 
 ---
+
+
+# 24. 开机自启动与后台常驻设计
+
+## 24.1 设计目标
+
+理想情况下，FocusLedger 应该是一个开机自启动、后台常驻的本地应用。
+
+原因是生产力审计系统不能依赖用户每天手动打开。  
+如果用户忘记启动应用，当天数据就会缺失，日报也会失真。
+
+因此系统应满足：
+
+```text
+开机后自动启动
+后台持续运行
+自动开始采集应用/浏览器/idle 数据
+异常退出后可恢复
+用户可从托盘查看状态
+用户可暂停或退出
+```
+
+目标行为：
+
+```text
+电脑开机
+→ FocusLedger 自动启动
+→ 后台 collector 开始运行
+→ 托盘图标显示采集状态
+→ 当天 activity ledger 自动生成
+→ 晚上生成 daily review
+```
+
+---
+
+## 24.2 应用运行形态
+
+FocusLedger 不应只作为一个普通前台窗口运行，而应拆成两个层级：
+
+```text
+1. Background Service / Agent
+2. User Interface / Dashboard
+```
+
+### Background Service / Agent
+
+负责长期运行的数据采集和分类：
+
+```text
+active app tracking
+window title tracking
+keyboard/mouse idle detection
+browser context collection
+audio state detection
+activity segment generation
+local database writing
+lightweight rule classification
+reminder trigger
+```
+
+### User Interface / Dashboard
+
+负责用户交互：
+
+```text
+查看今日统计
+查看 activity timeline
+管理 todo / deliverable
+与 LLM Agent 对话
+查看 daily review
+修改错误分类
+调整配置
+暂停/恢复采集
+```
+
+这样即使用户没有打开 dashboard，后台 agent 也可以继续记录数据。
+
+---
+
+## 24.3 系统托盘设计
+
+Windows MVP 建议提供 system tray 图标。
+
+托盘菜单至少包括：
+
+```text
+Open Dashboard
+Pause Tracking
+Resume Tracking
+Start Break
+View Today's Summary
+Settings
+Quit FocusLedger
+```
+
+托盘状态可以显示：
+
+```text
+绿色：正在记录
+黄色：暂停记录
+红色：collector 异常
+灰色：数据库不可用或未初始化
+```
+
+用户不需要一直打开主窗口，但应该能明确知道系统是否正在运行。
+
+---
+
+## 24.4 开机自启动策略
+
+### Windows MVP
+
+Windows 上可使用以下方式之一：
+
+```text
+Startup folder shortcut
+Registry Run key
+Windows Task Scheduler
+Windows Service
+```
+
+MVP 推荐顺序：
+
+```text
+1. Startup folder shortcut
+2. Windows Task Scheduler
+3. Windows Service
+```
+
+### 推荐 MVP 方案：Startup Folder
+
+第一版可以将 FocusLedger 的启动脚本或打包后的 exe 快捷方式放入：
+
+```text
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+```
+
+优点：
+
+```text
+实现简单
+权限要求低
+适合个人使用
+容易关闭
+```
+
+缺点：
+
+```text
+可靠性一般
+用户登出前不会运行
+不适合系统级后台服务
+```
+
+### 进阶方案：Task Scheduler
+
+后续可以使用 Windows Task Scheduler：
+
+```text
+Trigger: At log on
+Action: Start FocusLedger background agent
+Run only when user is logged on
+Restart on failure
+```
+
+优点：
+
+```text
+比 Startup folder 更可靠
+可配置失败重启
+适合正式版本
+```
+
+### 不建议 MVP 使用 Windows Service
+
+Windows Service 更系统级，但对本项目 MVP 不必要。
+
+原因：
+
+```text
+实现复杂
+权限更麻烦
+访问用户桌面窗口和浏览器上下文更困难
+调试成本高
+```
+
+FocusLedger 需要读取当前用户的 foreground window、浏览器 tab、键鼠 idle 等用户会话信息，因此以 user-level background app 运行更合适。
+
+---
+
+## 24.5 后台进程拆分
+
+推荐进程结构：
+
+```text
+focusledger_agent
+  - 长期后台运行
+  - 负责采集、分类、写数据库
+
+focusledger_ui
+  - 用户打开 dashboard 时运行
+  - 负责展示、配置、LLM 对话
+
+focusledger_browser_extension
+  - 可选
+  - 负责浏览器 URL/title/audio/incognito 状态采集
+```
+
+MVP 也可以先单进程实现：
+
+```text
+Python app
+  - collector thread
+  - classifier thread
+  - local FastAPI server
+  - Streamlit / simple web UI
+```
+
+但长期建议拆开，避免 UI 崩溃导致 collector 停止。
+
+---
+
+## 24.6 自启动后的默认行为
+
+开机自动启动后，系统不应立即弹出主窗口打扰用户。
+
+推荐行为：
+
+```text
+后台静默启动
+托盘图标出现
+collector 自动开始
+首次安装后显示一次 onboarding
+之后默认不弹主窗口
+```
+
+如果发生异常，例如数据库不可写、浏览器插件未连接、collector 崩溃，则可以显示通知。
+
+---
+
+## 24.7 暂停与隐私控制
+
+即使是开机自启动应用，也必须允许用户随时暂停。
+
+暂停模式：
+
+```text
+Pause for 15 minutes
+Pause for 1 hour
+Pause until tomorrow
+Pause indefinitely
+```
+
+暂停后：
+
+```text
+停止采集窗口标题
+停止采集浏览器上下文
+停止 idle 记录
+日报中记录 paused interval
+```
+
+日报中可以显示：
+
+```text
+14:00 - 15:30 Tracking paused by user
+```
+
+这样可以避免数据缺失被误判为 idle 或 distraction。
+
+---
+
+## 24.8 异常恢复
+
+后台 agent 应定期写入 heartbeat。
+
+新增表：
+
+```sql
+CREATE TABLE agent_heartbeats (
+    id TEXT PRIMARY KEY,
+    timestamp DATETIME,
+    agent_version TEXT,
+    status TEXT,
+    message TEXT
+);
+```
+
+用途：
+
+```text
+判断 agent 是否正常运行
+发现采集中断时间段
+日报中标注 missing data
+支持异常恢复
+```
+
+如果系统检测到上一次 heartbeat 距离当前时间太久，可以记录：
+
+```text
+collector_gap
+```
+
+例如：
+
+```text
+09:10 - 10:25 FocusLedger agent not running
+```
+
+该时间段不应被推测为 idle 或 distraction，而应标记为：
+
+```text
+missing_data
+```
+
+---
+
+## 24.9 数据完整性原则
+
+开机自启动后，日报应区分：
+
+```text
+idle
+attention_gap
+paused
+missing_data
+```
+
+四者不能混为一谈。
+
+含义：
+
+| 状态 | 含义 |
+|---|---|
+| idle | 系统运行中，但用户长时间无输入 |
+| attention_gap | 工作/学习上下文中出现长时间无输入 |
+| paused | 用户主动暂停采集 |
+| missing_data | agent 未运行或异常，无法判断 |
+
+这对于日报可信度很重要。
+
+---
+
+## 24.10 MVP 需求更新
+
+开机自启动加入后，MVP 必须新增：
+
+```text
+1. Background agent
+2. User-level autostart
+3. System tray status
+4. Pause / resume tracking
+5. Agent heartbeat
+6. Missing data detection
+```
+
+MVP 仍不需要：
+
+```text
+1. Windows Service
+2. 系统级强制锁应用
+3. 多用户账户系统
+4. 云同步
+```
+
+---
+
+## 24.11 Windows MVP 实现建议
+
+建议 MVP 使用：
+
+```text
+Python background process
+pystray system tray
+SQLite local database
+Startup folder shortcut
+FastAPI local API
+Streamlit or React dashboard
+```
+
+目录结构可以扩展为：
+
+```text
+focusledger/
+  agent/
+    main.py
+    autostart.py
+    heartbeat.py
+    tray.py
+    collector.py
+    classifier.py
+  api/
+    main.py
+  ui/
+    streamlit_app.py
+  db/
+    models.py
+    database.py
+  config/
+    attention.yaml
+    rules.yaml
+    privacy.yaml
+```
+
+`autostart.py` 负责：
+
+```text
+enable autostart
+disable autostart
+check autostart status
+```
+
+`heartbeat.py` 负责：
+
+```text
+write heartbeat every 30 seconds
+detect last shutdown
+record missing_data intervals
+```
+
+`tray.py` 负责：
+
+```text
+show tray icon
+open dashboard
+pause tracking
+resume tracking
+quit app
+```
+
+---
+
+## 24.12 用户体验目标
+
+最终用户体验应类似：
+
+```text
+开机后无需手动操作。
+FocusLedger 在后台自动运行。
+用户从托盘可以看到它正在记录。
+晚上打开 dashboard 或对话窗口，即可看到当天真实生产力结算。
+```
+
+系统不应该变成一个需要用户每天维护的任务。  
+它应该像一个本地生产力审计守护进程一样，持续、低打扰、可暂停、可审计。
+
+
+# 25. 交互模式与工作制设计修订
+
+## 25.1 当前 UI 策略：Terminal-first
+
+当前版本不需要图形化 UI，不需要 Streamlit、React 或桌面窗口。  
+MVP 采用 terminal-first 交互方式。
+
+原因：
+
+```text
+开发简单
+跨平台更容易
+适合 Codex 快速实现
+减少 UI 复杂度
+核心先验证采集、分类、提醒、日报、LLM 规划
+```
+
+因此当前交互方式为：
+
+```text
+用户正常使用电脑
+FocusLedger 后台运行
+如果检测到分心或长时间异常，弹出 terminal 提醒
+用户在 terminal 中选择原因
+到下班点时，terminal 弹出日报输入流程
+用户输入今日 deliverable 进展
+LLM 生成完整日报和明日计划
+日报保存为长期日记
+```
+
+后续可以再做：
+
+```text
+TUI
+Web dashboard
+Desktop tray app
+Mobile companion
+```
+
+但 MVP 不需要。
+
+---
+
+## 25.2 跨平台支持
+
+项目需要支持三系统：
+
+```text
+Windows
+macOS
+Linux
+```
+
+但不同系统采集能力不同，因此应采用统一接口 + 平台适配器。
+
+推荐结构：
+
+```text
+focusledger/
+  collectors/
+    base.py
+    windows.py
+    macos.py
+    linux.py
+  attention/
+    idle_detector.py
+  browser/
+    base.py
+    chrome.py
+    firefox.py
+  cli/
+    main.py
+  agent/
+    planner.py
+  db/
+    models.py
+```
+
+抽象接口：
+
+```python
+class ActivityCollector:
+    def get_active_app(self) -> ActiveAppInfo:
+        ...
+
+    def get_idle_seconds(self) -> float:
+        ...
+
+    def get_audio_state(self) -> AudioState:
+        ...
+```
+
+平台实现：
+
+```text
+Windows:
+  - foreground window
+  - process name
+  - window title
+  - GetLastInputInfo idle detection
+
+macOS:
+  - active application
+  - window title if permission granted
+  - idle time via system APIs
+  - accessibility permission may be required
+
+Linux:
+  - X11 support easier
+  - Wayland restrictions likely
+  - idle detection depends on desktop environment
+```
+
+MVP 可以先完整支持 Windows，同时保留 macOS/Linux 接口。  
+但 proposal 和 repo 结构应按三系统设计。
+
+---
+
+## 25.3 后台运行 + Terminal 呼出
+
+系统应支持两种 terminal 交互：
+
+```text
+1. 被动弹出：检测到分心、到下班点、需要日报、需要补总结
+2. 主动呼出：用户手动运行 CLI 命令
+```
+
+主动命令示例：
+
+```bash
+focusledger status
+focusledger summary
+focusledger offwork
+focusledger overtime
+focusledger pause
+focusledger resume
+focusledger holiday
+focusledger review
+focusledger config
+```
+
+推荐 CLI 功能：
+
+| 命令 | 功能 |
+|---|---|
+| `focusledger status` | 查看当前记录状态 |
+| `focusledger summary` | 查看今日临时总结 |
+| `focusledger offwork` | 提前下班并进入日报流程 |
+| `focusledger overtime` | 下班后继续记录 |
+| `focusledger pause` | 暂停记录 |
+| `focusledger resume` | 恢复记录 |
+| `focusledger holiday` | 标记今天/多天为假期 |
+| `focusledger review` | 补写未完成日报 |
+| `focusledger config` | 修改语言、工作时间、阈值等配置 |
+
+---
+
+## 25.4 分心提醒交互
+
+当系统检测到用户分心时，不直接强制关闭应用，而是弹出 terminal 提醒。
+
+触发场景包括：
+
+```text
+长时间游戏
+长时间娱乐网站
+长时间无键鼠输入
+长时间 attention gap
+工作时间内使用娱乐网站
+无痕/隐私浏览窗口被检测到
+```
+
+提醒示例：
+
+```text
+FocusLedger detected a possible distraction.
+
+Time: 14:35 - 15:02
+Detected activity: YouTube / entertainment
+Idle gap: 8 min
+Current workday status: working
+
+What were you doing? You may select multiple:
+
+[1] Watching entertainment video
+[2] Gaming
+[3] Social media / chatting
+[4] Phone distraction
+[5] Eating
+[6] Bathroom
+[7] Went outside
+[8] Break
+[9] Actually working / false positive
+[10] Other
+```
+
+用户可以多选，例如：
+
+```text
+5,6
+```
+
+表示吃饭 + 上厕所。  
+这些信息进入 `user_context_labels`，不会简单归入 idle。
+
+---
+
+## 25.5 多选分心/中断标签
+
+长时间没动静不一定是手机分心，也可能是：
+
+```text
+吃饭
+上厕所
+出门
+洗澡
+睡觉
+休息
+接电话
+纸质阅读
+和朋友聊天
+误判
+```
+
+因此 `idle_gaps` 或 `activity_segments` 中需要支持多标签。
+
+新增字段建议：
+
+```sql
+user_context_labels TEXT
+```
+
+存 JSON array：
+
+```json
+["meal", "bathroom"]
+```
+
+推荐标签 taxonomy：
+
+```text
+phone_distraction
+meal
+bathroom
+outside
+break
+sleep
+social_offline
+paper_reading
+thinking
+errand
+false_positive
+other
+```
+
+这些标签在日报里应分开显示，不要全部粗暴归类为 distraction。
+
+例如：
+
+```text
+Idle / gaps:
+- 31m meal
+- 12m bathroom
+- 25m possible phone distraction
+- 40m outside
+```
+
+---
+
+## 25.6 无痕窗口归类调整
+
+无痕/隐私浏览不再单独作为日报类别。  
+检测到无痕窗口时，直接归入 `entertainment`。
+
+规则：
+
+```text
+if browser_private_mode_detected:
+    browser_mode = "incognito" or "private"
+    content_label = "entertainment"
+    productivity_label = "entertainment"
+    effective_seconds = 0
+```
+
+系统不解析无痕窗口中的 URL，不调用 LLM 判断内容，也不尝试将其算作生产力。
+
+日报中不需要单独列出 incognito/private browsing time，可以合并到：
+
+```text
+Entertainment time
+```
+
+但底层 segment 仍可保留 `browser_mode` 字段，方便审计。
+
+---
+
+# 26. 工作日、下班时间与日报边界
+
+## 26.1 需要工作日概念
+
+FocusLedger 需要有 workday，而不是简单按自然日 00:00 - 23:59 统计。
+
+原因：
+
+```text
+用户可能晚上工作、白天睡觉
+用户可能跨午夜工作
+用户可能提前下班或加班
+用户可能几天不上班
+日报应该按“工作周期”而不是自然日切分
+```
+
+因此系统应引入：
+
+```text
+Workday Session
+```
+
+Workday Session 表示一个用户认为的“今天的工作周期”。
+
+---
+
+## 26.2 Workday Session 数据结构
+
+```sql
+CREATE TABLE workday_sessions (
+    id TEXT PRIMARY KEY,
+    workday_date DATE,
+    start_time DATETIME,
+    planned_end_time DATETIME,
+    actual_end_time DATETIME,
+    status TEXT,
+
+    is_overtime BOOLEAN,
+    is_holiday BOOLEAN,
+    is_sleep_shifted BOOLEAN,
+
+    summary_submitted BOOLEAN,
+    summary_submitted_at DATETIME,
+
+    user_deliverable_notes TEXT,
+    llm_daily_review TEXT,
+    llm_tomorrow_plan TEXT,
+
+    created_at DATETIME,
+    updated_at DATETIME
+);
+```
+
+`status` 可选：
+
+```text
+active
+offwork
+overtime
+holiday
+missing_summary
+closed
+```
+
+---
+
+## 26.3 默认工作时间
+
+用户可以配置默认工作时间：
+
+```yaml
+work_schedule:
+  default_start_time: "10:00"
+  default_end_time: "18:00"
+  timezone: "local"
+  workdays: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+```
+
+考虑到学生假期作息不稳定，默认不强制周末休息。  
+用户可以每天选择：
+
+```text
+今天工作
+今天放假
+今天晚点开始
+今天加班
+今天提前下班
+```
+
+---
+
+## 26.4 下班时间行为
+
+到达配置的下班时间后，系统应弹出 terminal：
+
+```text
+It is your planned off-work time.
+
+Do you want to end today's workday?
+
+[1] End workday and write daily summary
+[2] Continue overtime
+[3] Pause tracking
+[4] Mark today as holiday
+[5] Remind me later
+```
+
+如果用户选择 `End workday`，进入日报输入流程。  
+如果用户选择 `Continue overtime`，系统继续记录，并将 workday status 设为 `overtime`。
+
+---
+
+## 26.5 主动提前下班
+
+用户可以主动运行：
+
+```bash
+focusledger offwork
+```
+
+然后系统进入：
+
+```text
+结束当前 workday
+停止记录或切换到 offwork mode
+要求用户输入今日 deliverable 进展
+生成日报
+```
+
+offwork 之后默认不再记录，除非用户加班。
+
+---
+
+## 26.6 加班模式
+
+用户可以主动运行：
+
+```bash
+focusledger overtime
+```
+
+或者在下班弹窗选择加班。
+
+加班模式：
+
+```text
+继续记录活动
+segment 标记为 overtime
+日报中单独显示 overtime productive time
+```
+
+例如：
+
+```text
+Overtime:
+- 21:30 - 23:10 coding
+- Effective productive overtime: 1h 12m
+```
+
+---
+
+## 26.7 下班后默认不记录
+
+到达下班点并完成日报后，系统默认停止记录。
+
+下班后的活动不计入当天工作审计，除非用户显式进入加班模式。
+
+原因：
+
+```text
+避免娱乐时间被无限审计
+保护私人生活边界
+减少用户反感
+```
+
+但系统可以保留状态：
+
+```text
+offwork
+```
+
+此时只监听用户是否主动启动：
+
+```bash
+focusledger overtime
+focusledger start
+```
+
+---
+
+## 26.8 非健康作息与跨午夜工作
+
+如果用户晚上工作、白天睡觉，不能简单按日期切分日报。
+
+建议规则：
+
+```text
+Workday 以 start_time 和 actual_end_time 切分
+不是按自然日 00:00 切分
+```
+
+例如：
+
+```text
+Workday 2026-05-06:
+  start: 2026-05-06 20:30
+  end:   2026-05-07 04:10
+```
+
+日报标题可以显示：
+
+```text
+Workday Review: 2026-05-06 20:30 - 2026-05-07 04:10
+```
+
+如果系统发现用户跨午夜仍在工作，不自动生成日报，而是等用户下班或达到最大工作窗口。
+
+推荐最大工作窗口：
+
+```yaml
+max_workday_hours: 18
+```
+
+超过后提醒用户：
+
+```text
+This workday has lasted over 18 hours.
+Do you want to close it, continue overtime, or mark part of it as sleep/offline?
+```
+
+---
+
+# 27. 日报流程：用户先输入，LLM 后总结
+
+## 27.1 设计原则
+
+日报不应该完全由系统自动生成。  
+因为系统只能看到设备行为，不能完全知道用户实际完成了什么。
+
+因此日报流程应为：
+
+```text
+1. 系统生成当天客观行为摘要
+2. 用户输入今天做了哪些 deliverables
+3. 用户输入每个 deliverable 做到了什么程度
+4. LLM 结合客观行为 + 用户输入生成完整版日报
+5. LLM 规划明天任务
+6. 保存为长期日记
+```
+
+---
+
+## 27.2 下班日报输入流程
+
+terminal 示例：
+
+```text
+Workday ended.
+
+Objective activity summary:
+- Core productive: 2h 15m
+- General learning: 45m
+- Entertainment: 3h 20m
+- Gaming: 1h 10m
+- Attention gaps: 1h 05m
+
+Please write what you completed today.
+You can use free text.
+
+Example:
+- Finished MicroK8s deployment section
+- Debugged MinIO bucket init issue
+- Reviewed VAE lecture halfway
+- Did not start SFA review
+
+Your input:
+>
+```
+
+用户输入后，系统继续问：
+
+```text
+For each important deliverable, describe progress level:
+
+1. Air Quality Monitoring deployment doc
+Progress: [not started / partial / mostly done / done / blocked]
+Notes:
+>
+
+2. ML exam review
+Progress:
+>
+```
+
+---
+
+## 27.3 LLM 完整日报生成
+
+LLM 输入应包括：
+
+```text
+objective activity summary
+activity segments
+attention gaps and user labels
+gaming/entertainment time
+todo/deliverable list
+user-written daily notes
+user progress ratings
+unfinished tasks
+historical plan from previous day
+```
+
+LLM 输出：
+
+```text
+完整日报
+deliverable progress summary
+今天的主要问题
+明天计划
+建议优先级
+风险提醒
+```
+
+---
+
+## 27.4 日报保存为日记
+
+用户完成日报后，系统应保存为长期记录。
+
+推荐保存两份：
+
+```text
+SQLite structured record
+Markdown daily journal
+```
+
+Markdown 路径：
+
+```text
+journals/
+  2026/
+    05/
+      2026-05-06_workday.md
+```
+
+跨午夜情况：
+
+```text
+journals/
+  2026/
+    05/
+      2026-05-06_2030_to_2026-05-07_0410_workday.md
+```
+
+日报 markdown 应包含：
+
+```text
+workday time range
+objective stats
+user-written deliverable notes
+LLM-generated review
+tomorrow plan
+raw issue summary
+manual corrections
+```
+
+---
+
+## 27.5 日记用途
+
+长期保存日报的目的：
+
+```text
+几年后可以回看自己每天做了什么
+追踪长期成长轨迹
+复盘项目推进过程
+观察拖延模式和生产力变化
+积累个人工作日志
+```
+
+因此日报应尽量可读，不只是 JSON 数据。
+
+---
+
+# 28. 未提交日报的补写机制
+
+## 28.1 问题
+
+用户可能下班时没有写日报，或者直接关机、睡觉、离开。
+
+这时不能丢失总结流程。
+
+## 28.2 第二天上班提醒
+
+如果上一个 workday 没有完成日报，第二天开工时提醒：
+
+```text
+You have an unfinished daily review from your last workday.
+
+Workday:
+2026-05-06 20:30 - 2026-05-07 04:10
+
+Do you want to complete it now?
+
+[1] Complete review now
+[2] Skip and mark as incomplete
+[3] Remind me later
+[4] Mark previous day as holiday/off
+```
+
+系统应允许补写。
+
+---
+
+## 28.3 missing_summary 状态
+
+如果下班后未总结，workday status 设为：
+
+```text
+missing_summary
+```
+
+直到用户补写或跳过。
+
+---
+
+# 29. 假期与长时间未上班
+
+## 29.1 假期需求
+
+用户可能几天没来上班。系统不应自动把这些天全部视为 failure。
+
+当系统发现用户连续多天没有 workday 或没有启动记录，应询问：
+
+```text
+You have not started a workday for 3 days.
+
+What happened?
+
+[1] Vacation / holiday
+[2] Sick / personal rest
+[3] Traveling
+[4] Forgot to use FocusLedger
+[5] Other
+```
+
+## 29.2 假期记录
+
+新增表：
+
+```sql
+CREATE TABLE holidays (
+    id TEXT PRIMARY KEY,
+    start_date DATE,
+    end_date DATE,
+    label TEXT,
+    notes TEXT,
+    created_at DATETIME
+);
+```
+
+标签：
+
+```text
+vacation
+sick
+travel
+personal_rest
+school_break
+forgot_tracking
+other
+```
+
+## 29.3 假期不计入失败
+
+假期期间：
+
+```text
+不生成 productivity failure
+不提醒未完成日报
+不要求补工作记录
+可在长期日记中保留一条 holiday note
+```
+
+例如：
+
+```text
+2026-05-08 to 2026-05-10:
+Holiday: travel
+Notes: Went to Atlanta, no work tracking.
+```
+
+---
+
+# 30. 多设备同步设计预留
+
+## 30.1 需求背景
+
+用户可能在不同设备上工作，例如：
+
+```text
+家里的台式机
+学校的笔记本
+实验室电脑
+虚拟机
+```
+
+因此后期需要支持多设备同步。
+
+## 30.2 当前 MVP 策略
+
+MVP 不需要立即实现云同步，但数据库 schema 和日志设计应预留 `device_id`。
+
+所有核心表都应包含：
+
+```sql
+device_id TEXT
+```
+
+例如：
+
+```sql
+ALTER TABLE activity_segments ADD COLUMN device_id TEXT;
+ALTER TABLE workday_sessions ADD COLUMN device_id TEXT;
+ALTER TABLE agent_heartbeats ADD COLUMN device_id TEXT;
+```
+
+## 30.3 设备注册
+
+新增表：
+
+```sql
+CREATE TABLE devices (
+    id TEXT PRIMARY KEY,
+    device_name TEXT,
+    platform TEXT,
+    hostname TEXT,
+    created_at DATETIME,
+    last_seen_at DATETIME,
+    sync_enabled BOOLEAN
+);
+```
+
+示例：
+
+```json
+{
+  "id": "device_home_desktop",
+  "device_name": "Home Desktop",
+  "platform": "Windows",
+  "hostname": "JERRY-PC",
+  "sync_enabled": true
+}
+```
+
+## 30.4 后期同步方式
+
+后期可选方案：
+
+```text
+Local-first sync
+Cloud database
+Self-hosted server
+Git-based journal sync
+Syncthing / Dropbox / iCloud Drive folder sync
+```
+
+考虑到日报会保存为 markdown，最简单可行的长期方案是：
+
+```text
+SQLite for local structured data
+Markdown journals synced by Git or cloud folder
+```
+
+正式多设备同步可采用：
+
+```text
+central server + device_id + conflict resolution
+```
+
+## 30.5 多设备日报合并
+
+同一个 workday 可能来自多台设备。
+
+例如：
+
+```text
+09:00 - 13:00 学校笔记本
+15:00 - 18:00 家里台式机
+```
+
+日报应按 workday 聚合，而不是按 device 分裂。
+
+Daily review 输入应包含：
+
+```text
+all activity_segments where workday_session_id = current_workday
+across all devices
+```
+
+需要处理：
+
+```text
+clock skew
+overlapping segments
+duplicate records
+missing device sync
+```
+
+MVP 可以只保留 schema，不实现复杂同步。
+
+---
+
+# 31. 双语支持
+
+## 31.1 支持语言
+
+项目应支持：
+
+```text
+中文
+English
+```
+
+配置：
+
+```yaml
+language: "zh"  # zh or en
+```
+
+## 31.2 双语范围
+
+需要双语的部分：
+
+```text
+terminal prompts
+菜单选项
+日报模板
+LLM prompt
+LLM 输出语言
+错误提示
+配置说明
+```
+
+## 31.3 i18n 结构
+
+推荐结构：
+
+```text
+i18n/
+  zh.yaml
+  en.yaml
+```
+
+示例：
+
+```yaml
+daily_review_prompt_title:
+  zh: "请填写今天完成了哪些事情"
+  en: "Please write what you completed today"
+
+offwork_prompt:
+  zh: "已经到下班时间，是否结束今天的工作？"
+  en: "It is your planned off-work time. Do you want to end today's workday?"
+```
+
+代码中不要硬编码中文或英文。
+
+## 31.4 LLM 输出语言
+
+LLM Agent 应根据用户配置输出。
+
+例如：
+
+```yaml
+llm:
+  output_language: "zh"
+```
+
+如果用户切换英文，则日报、计划、提醒都应切到英文。
+
+---
+
+# 32. 更新后的 MVP 范围
+
+## 32.1 必须完成
+
+```text
+1. Terminal-first CLI interaction
+2. Cross-platform architecture with platform adapters
+3. Windows collector as first complete implementation
+4. User-level autostart / background agent
+5. Active app / window title tracking
+6. Keyboard/mouse idle detection
+7. Unified attention thresholds
+8. Automatic activity segment generation
+9. Browser URL/title/audio/mode collection
+10. Incognito/private browsing classified into entertainment
+11. Rule-based activity classification
+12. Video/audio content classification
+13. Todo/deliverable management
+14. Workday session model
+15. Offwork time and overtime mode
+16. Pause/resume tracking
+17. Distraction terminal prompt with multi-select labels
+18. User-written daily deliverable progress input
+19. LLM-generated full daily review after user input
+20. Markdown journal export
+21. Missing daily review reminder
+22. Holiday / vacation marking
+23. Bilingual support: Chinese and English
+24. Audio notification system for distraction, offwork, and review reminders
+25. Configurable mute / cooldown / test audio commands
+26. Device_id schema reserved for future multi-device sync
+```
+
+## 32.2 暂不需要
+
+```text
+1. 手动 focus session
+2. 不同注意力模式
+3. 摄像头检测
+4. 手机端监控
+5. GUI dashboard
+6. 系统级强制锁应用
+7. 云端多设备同步完整实现
+8. 复杂冲突解决
+9. OCR / screenshot 分析
+```
+
+---
+
+# 33. 更新后的核心用户流程
+
+## 33.1 正常工作日
+
+```text
+用户开机
+→ FocusLedger 后台启动
+→ 用户正常使用电脑
+→ 系统自动记录应用、浏览器、idle、音频状态
+→ 检测到分心时播放音频提醒并弹出 terminal
+→ 用户选择分心/中断原因
+→ 到下班时间播放音频提醒并弹出日报流程
+→ 用户输入今天做了哪些 deliverables 和完成程度
+→ LLM 生成完整版日报和明日计划
+→ 保存为 markdown 日记
+```
+
+## 33.2 提前下班
+
+```text
+用户运行 focusledger offwork
+→ 系统停止当前 workday
+→ 进入日报输入流程
+→ 生成日报
+→ 下班后默认不再记录
+```
+
+## 33.3 加班
+
+```text
+到下班时间
+→ 用户选择 overtime
+→ 系统继续记录
+→ segment 标记为 overtime
+→ 用户之后手动 offwork
+→ 生成包含 overtime 的日报
+```
+
+## 33.4 第二天补日报
+
+```text
+用户昨天没有写日报
+→ 第二天启动 workday
+→ terminal 提醒补写
+→ 用户补充昨日 deliverable 进展
+→ LLM 补生成昨日完整版日报
+```
+
+## 33.5 放假
+
+```text
+用户几天没工作
+→ 系统提醒
+→ 用户选择 vacation / sick / travel / personal rest
+→ 系统记录 holiday
+→ 不生成失败评价
+```
+
+---
+
+# 34. 更新后的成功标准
+
+MVP 成功标准更新为：
+
+系统能稳定完成以下闭环：
+
+```text
+自动后台记录
+→ 分心时音频 + terminal 提醒
+→ 用户标注中断原因
+→ 到下班时间要求用户填写 deliverable 进展
+→ LLM 生成完整日报和明日计划
+→ 保存长期 markdown 日记
+→ 第二天能补写漏掉的日报
+→ 假期能正确跳过
+```
+
+成功日报应包含：
+
+```text
+workday 时间范围
+客观设备行为统计
+用户手写 deliverable 进展
+中断/分心原因
+娱乐/游戏/泛知识/核心生产力分类
+LLM 生成的今日复盘
+LLM 生成的明日计划
+是否加班
+是否有 missing data
+```
+
+
+# 35. 音频提醒系统
+
+## 35.1 设计目标
+
+FocusLedger 需要接入本地音频系统，在关键事件发生时播放声音提醒用户。
+
+原因：
+
+```text
+terminal 提醒可能被用户忽略
+用户可能正在游戏、看视频、离开键盘或注意力漂移
+音频提醒比纯文字提醒更容易打断分心状态
+下班提醒需要明确、及时
+补日报提醒也需要更强提示
+```
+
+音频提醒的目标不是强制控制用户，而是提供低成本、明确、可配置的提示。
+
+---
+
+## 35.2 需要音频提醒的事件
+
+MVP 至少支持以下事件：
+
+```text
+1. distraction_detected
+2. long_idle_gap_detected
+3. offwork_time_reached
+4. daily_review_required
+5. missing_review_reminder
+6. overtime_started
+7. tracking_paused
+8. tracking_resumed
+9. holiday_prompt
+10. agent_error_or_collector_failure
+```
+
+其中最重要的是：
+
+```text
+分心提醒
+下班提醒
+日报提醒
+```
+
+---
+
+## 35.3 音频提醒与 Terminal 提醒联动
+
+音频提醒不应单独存在，而应和 terminal prompt 联动。
+
+典型流程：
+
+```text
+系统检测到分心
+→ 播放分心提醒音
+→ 弹出 terminal prompt
+→ 用户选择当前在做什么
+→ 系统记录用户选择
+```
+
+下班流程：
+
+```text
+到达计划下班时间
+→ 播放下班提醒音
+→ 弹出 terminal prompt
+→ 用户选择下班、加班、暂停、稍后提醒或放假
+```
+
+补日报流程：
+
+```text
+第二天检测到未完成日报
+→ 播放补日报提醒音
+→ 弹出 terminal prompt
+→ 用户选择现在补写、稍后提醒、跳过或标记为假期
+```
+
+---
+
+## 35.4 音频事件配置
+
+推荐使用配置文件：
+
+```yaml
+audio:
+  enabled: true
+  volume: 0.7
+  mute_during_offwork: true
+  respect_do_not_disturb: true
+  repeat_until_acknowledged: false
+  max_repeat_count: 3
+  repeat_interval_seconds: 30
+
+  sounds:
+    distraction_detected: "assets/sounds/distraction.wav"
+    long_idle_gap_detected: "assets/sounds/idle_gap.wav"
+    offwork_time_reached: "assets/sounds/offwork.wav"
+    daily_review_required: "assets/sounds/daily_review.wav"
+    missing_review_reminder: "assets/sounds/missing_review.wav"
+    overtime_started: "assets/sounds/overtime.wav"
+    tracking_paused: "assets/sounds/pause.wav"
+    tracking_resumed: "assets/sounds/resume.wav"
+    error: "assets/sounds/error.wav"
+```
+
+用户应能通过 CLI 修改：
+
+```bash
+focusledger audio on
+focusledger audio off
+focusledger audio test
+focusledger audio volume 0.5
+focusledger audio set distraction_detected assets/sounds/custom.wav
+```
+
+---
+
+## 35.5 音频提醒强度
+
+不同事件应使用不同强度的提醒。
+
+| 事件 | 声音强度 | 是否可重复 |
+|---|---|---|
+| 分心提醒 | 中 | 可选 |
+| 长时间 idle | 低/中 | 可选 |
+| 下班提醒 | 中/高 | 可重复 |
+| 日报填写 | 中 | 可重复 |
+| 补日报 | 中 | 可重复 |
+| collector 异常 | 高 | 可重复 |
+| 暂停/恢复 | 低 | 不重复 |
+
+建议默认：
+
+```text
+分心提醒播放一次
+下班提醒播放一次，并弹出 terminal
+日报提醒如果用户没有响应，可每 30 分钟提醒一次，最多 3 次
+错误提醒可以更明显
+```
+
+---
+
+## 35.6 勿扰与静音策略
+
+音频提醒必须可控，避免变成新的干扰源。
+
+支持：
+
+```text
+全局静音
+下班后静音
+睡眠时间静音
+会议/演讲/录屏时静音
+游戏时是否提醒可配置
+勿扰时间段
+```
+
+配置示例：
+
+```yaml
+audio:
+  enabled: true
+  quiet_hours:
+    enabled: true
+    start: "01:00"
+    end: "09:00"
+
+  policies:
+    play_during_gaming: true
+    play_during_video: true
+    play_when_system_muted: false
+    play_after_offwork: false
+```
+
+如果系统处于 offwork 状态，默认不播放分心提醒。  
+如果用户进入 overtime 状态，则恢复提醒。
+
+---
+
+## 35.7 跨平台音频后端
+
+项目需要支持 Windows、macOS、Linux，因此音频播放应通过统一接口。
+
+推荐接口：
+
+```python
+class AudioNotifier:
+    def play(self, event_name: str) -> None:
+        ...
+
+    def test(self) -> None:
+        ...
+
+    def set_volume(self, volume: float) -> None:
+        ...
+
+    def is_available(self) -> bool:
+        ...
+```
+
+平台实现：
+
+```text
+Windows:
+  - winsound for simple WAV playback
+  - playsound / sounddevice for richer playback
+
+macOS:
+  - afplay command
+  - sounddevice / simpleaudio
+
+Linux:
+  - paplay / aplay
+  - sounddevice / simpleaudio
+```
+
+MVP 推荐：
+
+```text
+优先使用 simpleaudio 或 sounddevice
+失败时 fallback 到系统命令
+再失败时只显示 terminal 提醒
+```
+
+系统不应因为音频播放失败而停止记录。
+
+---
+
+## 35.8 音频文件策略
+
+不建议 repo 中放大量复杂音频。  
+MVP 可以提供少量短音效：
+
+```text
+distraction.wav
+offwork.wav
+daily_review.wav
+error.wav
+```
+
+音效要求：
+
+```text
+短
+清晰
+不刺耳
+不含版权风险
+可替换
+```
+
+也可以支持系统 beep fallback：
+
+```text
+如果音频文件不存在
+→ 使用系统 beep
+→ 同时输出 terminal warning
+```
+
+---
+
+## 35.9 与系统音量/音频播放检测的关系
+
+FocusLedger 需要区分两个音频方向：
+
+```text
+1. audio notifier：系统主动播放提醒音
+2. audio state detector：检测浏览器/系统是否正在播放音频，用于判断 lecture/video 场景
+```
+
+这两个模块不能混淆。
+
+```text
+AudioNotifier:
+  播放提醒用户的声音
+
+AudioStateDetector:
+  检测用户当前是否在播放音频/视频
+```
+
+例如：
+
+```text
+YouTube 正在播放 VAE lecture
+→ AudioStateDetector 发现 audio_playing = true
+
+用户已经娱乐视频 40 分钟
+→ AudioNotifier 播放 distraction reminder
+```
+
+---
+
+## 35.10 事件节流
+
+避免频繁播放音频。
+
+每个事件应有 cooldown：
+
+```yaml
+audio_cooldowns:
+  distraction_detected_seconds: 600
+  long_idle_gap_detected_seconds: 900
+  offwork_time_reached_seconds: 3600
+  daily_review_required_seconds: 1800
+  missing_review_reminder_seconds: 3600
+  error_seconds: 300
+```
+
+例如：
+
+```text
+如果 10 分钟内已经播放过分心提醒，不再重复播放。
+```
+
+---
+
+## 35.11 日志记录
+
+每次音频提醒都应记录：
+
+```sql
+CREATE TABLE notification_events (
+    id TEXT PRIMARY KEY,
+    timestamp DATETIME,
+    event_type TEXT,
+    channel TEXT,
+    sound_file TEXT,
+    delivered BOOLEAN,
+    acknowledged BOOLEAN,
+    related_segment_id TEXT,
+    related_workday_id TEXT,
+    message TEXT
+);
+```
+
+`channel` 可选：
+
+```text
+terminal
+audio
+terminal+audio
+```
+
+用途：
+
+```text
+避免重复提醒
+分析用户是否忽略提醒
+复盘当天被提醒了几次
+debug 音频系统
+```
+
+---
+
+## 35.12 CLI 命令
+
+新增 CLI 命令：
+
+```bash
+focusledger audio on
+focusledger audio off
+focusledger audio test
+focusledger audio volume 0.7
+focusledger audio status
+focusledger audio list
+```
+
+示例：
+
+```bash
+focusledger audio test offwork_time_reached
+```
+
+输出：
+
+```text
+Playing sound for event: offwork_time_reached
+Sound file: assets/sounds/offwork.wav
+Status: delivered
+```
+
+---
+
+## 35.13 用户体验目标
+
+音频提醒的理想体验：
+
+```text
+用户分心时听到简短提示音
+terminal 同时出现选择菜单
+用户选择“吃饭 / 上厕所 / 手机分心 / 误判”等原因
+系统记录该中断原因
+
+到下班点时播放明确提示音
+terminal 询问是否下班、加班、暂停或稍后提醒
+用户填写今日 deliverable 进展
+系统生成完整日报
+```
+
+音频提醒应当：
+
+```text
+足够明显
+不刺耳
+可关闭
+有冷却时间
+不破坏 offwork/private time
+跨平台可用
+失败时不影响主流程
+```
 
 # 23. 总结
 
@@ -1226,4 +3209,4 @@ FocusLedger 的核心价值是：
 
 最终目标：
 
-> 让用户清楚看到自己每天是否真正推进了重要任务，而不是被游戏、视频、无痕浏览和注意力空窗吞掉时间。
+> 让用户清楚看到自己每天是否真正推进了重要任务，而不是被游戏、视频和注意力空窗吞掉时间。
