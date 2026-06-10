@@ -5,11 +5,13 @@ from datetime import date, datetime
 
 from focusledger.agent.heartbeat import latest_heartbeat
 from focusledger.agent.runner import AgentRunOptions, request_stop, run_agent
-from focusledger.config import config_path, ensure_config, load_config
+from focusledger.config import config_path, ensure_config, load_config, save_config
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
 from focusledger.logging_config import configure_logging
 from focusledger.services.activity import format_duration, list_timeline, summarize_by_app
+from focusledger.services.dev import reset_database
+from focusledger.services.privacy import redact_existing_private_browser_titles
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -45,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     config_subparsers = config_parser.add_subparsers(required=True)
     config_path_parser = config_subparsers.add_parser("path", help="Print config path.")
     config_path_parser.set_defaults(func=cmd_config_path)
+    config_set_parser = config_subparsers.add_parser("set", help="Update config values.")
+    config_set_subparsers = config_set_parser.add_subparsers(required=True)
+    poll_interval_parser = config_set_subparsers.add_parser(
+        "poll-interval",
+        help="Set foreground window sampling interval in seconds.",
+    )
+    poll_interval_parser.add_argument("seconds", type=int)
+    poll_interval_parser.set_defaults(func=cmd_config_set_poll_interval)
 
     timeline_parser = subparsers.add_parser("timeline", help="Show activity timeline.")
     add_date_args(timeline_parser)
@@ -54,6 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_date_args(summary_parser)
     summary_parser.add_argument("--app", action="store_true", help="Summarize by app/process.")
     summary_parser.set_defaults(func=cmd_summary)
+
+    privacy_parser = subparsers.add_parser("privacy", help="Privacy maintenance helpers.")
+    privacy_subparsers = privacy_parser.add_subparsers(required=True)
+    redact_parser = privacy_subparsers.add_parser(
+        "redact-private-browser-titles",
+        help="Redact private/incognito browser window titles already stored in the local database.",
+    )
+    redact_parser.set_defaults(func=cmd_privacy_redact_browser_titles)
+
+    dev_parser = subparsers.add_parser("dev", help="Development and testing helpers.")
+    dev_subparsers = dev_parser.add_subparsers(required=True)
+    reset_parser = dev_subparsers.add_parser("reset-db", help="Delete and recreate the local SQLite database.")
+    reset_parser.add_argument("--yes", action="store_true", help="Confirm destructive database reset.")
+    reset_parser.set_defaults(func=cmd_dev_reset_db)
 
     return parser
 
@@ -117,6 +141,26 @@ def cmd_config_path(args: argparse.Namespace) -> None:
     print(config_path(cfg.data_dir))
 
 
+def cmd_config_set_poll_interval(args: argparse.Namespace) -> None:
+    if args.seconds < 1:
+        raise SystemExit("poll interval must be at least 1 second")
+    cfg = ensure_config()
+    updated = type(cfg)(
+        data_dir=cfg.data_dir,
+        database_path=cfg.database_path,
+        log_path=cfg.log_path,
+        log_level=cfg.log_level,
+        poll_interval_seconds=args.seconds,
+        idle_threshold_seconds=cfg.idle_threshold_seconds,
+        platform=cfg.platform,
+        device_id=cfg.device_id,
+        language=cfg.language,
+        timezone=cfg.timezone,
+    )
+    save_config(updated)
+    print(f"poll_interval_seconds set to {args.seconds}")
+
+
 def cmd_timeline(args: argparse.Namespace) -> None:
     cfg = ensure_initialized()
     day = parse_target_date(args)
@@ -148,6 +192,34 @@ def cmd_summary(args: argparse.Namespace) -> None:
         process = row["process_name"]
         count = row["segment_count"]
         print(f"{duration:>10}  {count:>3} segments  {process}")
+
+
+def cmd_privacy_redact_browser_titles(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    with connect(cfg.database_path) as conn:
+        counts = redact_existing_private_browser_titles(conn)
+    print("Redacted private/incognito browser window titles.")
+    print(f"  raw_activity_events: {counts['raw_activity_events']}")
+    print(f"  activity_segments: {counts['activity_segments']}")
+
+
+def cmd_dev_reset_db(args: argparse.Namespace) -> None:
+    cfg = ensure_config()
+    if not args.yes:
+        print("This will delete and recreate the local FocusLedger SQLite database.")
+        print(f"Database: {cfg.database_path}")
+        print("Run again with --yes to confirm.")
+        return
+
+    deleted = reset_database(cfg.database_path)
+    print("Reset FocusLedger database.")
+    if deleted:
+        print("Deleted:")
+        for path in deleted:
+            print(f"  {path}")
+    else:
+        print("Deleted: none")
+    print(f"Recreated: {cfg.database_path}")
 
 
 def ensure_initialized():

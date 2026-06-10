@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timezone
 from sqlite3 import Connection
 
 from focusledger.models import ActiveWindowSnapshot
+from focusledger.services.privacy import sanitize_snapshot
 
 
 def record_activity_snapshot(
@@ -14,6 +15,7 @@ def record_activity_snapshot(
     snapshot: ActiveWindowSnapshot,
     segment_gap_seconds: int,
 ) -> None:
+    snapshot = sanitize_snapshot(snapshot)
     captured_at = snapshot.captured_at.isoformat()
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
