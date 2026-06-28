@@ -9,7 +9,12 @@ from focusledger.config import config_path, ensure_config, load_config, save_con
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
 from focusledger.logging_config import configure_logging
-from focusledger.services.activity import format_duration, list_timeline, summarize_by_app
+from focusledger.services.activity import (
+    format_duration,
+    list_timeline,
+    summarize_attention,
+    summarize_by_app,
+)
 from focusledger.services.dev import reset_database
 from focusledger.services.privacy import redact_existing_private_browser_titles
 
@@ -64,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_date_args(summary_parser)
     summary_parser.add_argument("--app", action="store_true", help="Summarize by app/process.")
     summary_parser.set_defaults(func=cmd_summary)
+
+    attention_parser = subparsers.add_parser(
+        "attention", help="Show active vs idle (keyboard/mouse) time per app."
+    )
+    add_date_args(attention_parser)
+    attention_parser.set_defaults(func=cmd_attention)
 
     privacy_parser = subparsers.add_parser("privacy", help="Privacy maintenance helpers.")
     privacy_subparsers = privacy_parser.add_subparsers(required=True)
@@ -192,6 +203,27 @@ def cmd_summary(args: argparse.Namespace) -> None:
         process = row["process_name"]
         count = row["segment_count"]
         print(f"{duration:>10}  {count:>3} segments  {process}")
+
+
+def cmd_attention(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    day = parse_target_date(args)
+    with connect(cfg.database_path) as conn:
+        data = summarize_attention(conn, day, cfg.poll_interval_seconds)
+    if not data["per_app"]:
+        print(f"No activity samples for {day}.")
+        return
+    print(f"Attention summary for {day}  (poll interval {cfg.poll_interval_seconds}s)")
+    print(
+        f"  active: {format_duration(data['active_seconds'])}"
+        f"   idle: {format_duration(data['idle_seconds'])}"
+        f"   unknown: {format_duration(data['unknown_seconds'])}"
+    )
+    print("  per app (active / idle):")
+    for row in data["per_app"]:
+        active = format_duration(row["active_seconds"])
+        idle = format_duration(row["idle_seconds"])
+        print(f"  {active:>10} active / {idle:>10} idle   {row['process_name']}")
 
 
 def cmd_privacy_redact_browser_titles(args: argparse.Namespace) -> None:

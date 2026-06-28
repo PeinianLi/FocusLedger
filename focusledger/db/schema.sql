@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS raw_activity_events (
     window_title TEXT,
     window_handle TEXT,
     source TEXT NOT NULL,
+    idle_seconds REAL,
     created_at TEXT NOT NULL
 );
 

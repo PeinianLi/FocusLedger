@@ -37,11 +37,13 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
 
             try:
                 snapshot = adapter.get_active_window()
+                idle_seconds = _read_idle_seconds(adapter)
                 record_activity_snapshot(
                     conn,
                     device_id=config.device_id,
                     snapshot=snapshot,
                     segment_gap_seconds=segment_gap_seconds,
+                    idle_seconds=idle_seconds,
                 )
                 write_heartbeat(conn, device_id=config.device_id)
             except Exception as exc:
@@ -54,6 +56,17 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
                 break
 
             time.sleep(config.poll_interval_seconds)
+
+
+def _read_idle_seconds(adapter) -> float | None:
+    """Read seconds since last keyboard/mouse input. Returns None if the platform
+    does not support idle detection, so a missing idle signal never drops the
+    activity sample itself."""
+    try:
+        return float(adapter.get_idle_seconds())
+    except Exception:
+        LOGGER.debug("idle detection unavailable", exc_info=True)
+        return None
 
 
 def request_stop(config: AppConfig) -> None:

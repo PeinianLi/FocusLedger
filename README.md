@@ -16,15 +16,16 @@ terminal-first 的早期 MVP，主要用于测试最基础的数据链路：
 | 平台 | 当前支持情况 |
 |---|---|
 | Windows | 已支持前台窗口采集。 |
-| macOS | 可以初始化配置和数据库，也可以运行 CLI 查询命令，但采集尚未实现。 |
+| macOS | 已支持前台应用采集；窗口标题需要授予辅助功能权限，且 Chrome / Edge 暂不可得。 |
 | Linux | 可以初始化配置和数据库，也可以运行 CLI 查询命令，但采集尚未实现。 |
 
 ## 环境要求
 
 - Python 3.11 或更新版本
-- 当前采集 MVP 推荐在 Windows 上测试
-
-当前版本不需要安装第三方 Python 包。
+- Windows 采集不需要安装第三方 Python 包。
+- macOS 采集默认使用系统自带命令（`lsappinfo` / `osascript` / `ioreg`），
+  不需要安装任何第三方包。如果已安装 PyObjC，会自动优先使用它。
+- Linux 暂不支持采集。
 
 ## Windows 使用方式
 
@@ -72,23 +73,39 @@ python -m focusledger stop
 
 ## macOS 使用方式
 
-当前 macOS 可以运行 CLI 初始化和查询命令：
+不需要安装任何第三方包，直接运行：
 
 ```bash
 cd /path/to/FocusLedger
 python -m focusledger init
+python -m focusledger start
+```
+
+另开一个终端查看状态和记录：
+
+```bash
 python -m focusledger status
 python -m focusledger timeline --today
 python -m focusledger summary --today
 ```
 
-macOS 的 active window 采集尚未实现。现在运行：
+权限说明：
 
-```bash
-python -m focusledger start
-```
+- 采集前台应用名、进程名、可执行路径不需要额外权限。
+- 采集窗口标题需要在「系统设置 → 隐私与安全性 → 辅助功能（Accessibility）」中
+  授予运行 FocusLedger 的终端（Terminal / iTerm / VS Code 等）权限。
+  未授权时窗口标题为空，但应用级别的采集仍然正常工作。
+- 首次授予权限后需要重启该终端。
 
-会提示 macOS collection reserved for a later phase。
+窗口标题的已知限制（subprocess 后端）：
+
+- 原生 Cocoa 应用（Finder、备忘录、预览、系统设置等）能通过辅助功能拿到窗口标题。
+- 基于 Chromium / Electron 的应用（Chrome、VS Code、Slack、Discord 等）不会通过
+  辅助功能暴露窗口标题，因此这些应用的标题为空，但应用级别采集照常工作。
+- 如果安装了 PyObjC（`pip install pyobjc-framework-Cocoa pyobjc-framework-Quartz`），
+  适配器会自动改用 Quartz + 屏幕录制（Screen Recording）权限，届时所有应用
+  （含 Chrome / VS Code）的窗口标题都能拿到。浏览器内的具体页面 / URL 仍计划在
+  后续浏览器扩展阶段（Phase 4）解决。
 
 ## Linux 使用方式
 
