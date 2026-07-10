@@ -20,6 +20,15 @@ class AppConfig:
     log_level: str
     poll_interval_seconds: int
     idle_threshold_seconds: int
+    low_activity_after_seconds: int
+    attention_gap_after_seconds: int
+    interrupted_after_seconds: int
+    hard_idle_after_seconds: int
+    attention_active_weight: float
+    attention_low_activity_weight: float
+    attention_gap_weight: float
+    attention_interrupted_weight: float
+    attention_hard_idle_weight: float
     platform: str
     device_id: str
     language: str
@@ -62,6 +71,15 @@ def build_default_config(data_dir: Path | None = None) -> AppConfig:
         log_level="INFO",
         poll_interval_seconds=5,
         idle_threshold_seconds=300,
+        low_activity_after_seconds=180,
+        attention_gap_after_seconds=600,
+        interrupted_after_seconds=1200,
+        hard_idle_after_seconds=1800,
+        attention_active_weight=1.0,
+        attention_low_activity_weight=0.5,
+        attention_gap_weight=0.0,
+        attention_interrupted_weight=0.0,
+        attention_hard_idle_weight=0.0,
         platform=os.name,
         device_id=f"device_{uuid.uuid4().hex[:12]}",
         language="zh",
@@ -95,6 +113,15 @@ def load_config() -> AppConfig:
         log_level=str(merged["log_level"]),
         poll_interval_seconds=int(merged["poll_interval_seconds"]),
         idle_threshold_seconds=int(merged["idle_threshold_seconds"]),
+        low_activity_after_seconds=int(merged["low_activity_after_seconds"]),
+        attention_gap_after_seconds=int(merged["attention_gap_after_seconds"]),
+        interrupted_after_seconds=int(merged["interrupted_after_seconds"]),
+        hard_idle_after_seconds=int(merged["hard_idle_after_seconds"]),
+        attention_active_weight=float(merged["attention_active_weight"]),
+        attention_low_activity_weight=float(merged["attention_low_activity_weight"]),
+        attention_gap_weight=float(merged["attention_gap_weight"]),
+        attention_interrupted_weight=float(merged["attention_interrupted_weight"]),
+        attention_hard_idle_weight=float(merged["attention_hard_idle_weight"]),
         platform=str(merged["platform"]),
         device_id=str(merged["device_id"]),
         language=str(merged["language"]),

@@ -9,6 +9,7 @@ from focusledger.config import AppConfig
 from focusledger.db.connection import connect
 from focusledger.platform import get_platform_adapter
 from focusledger.services.activity import record_activity_snapshot
+from focusledger.services.attention import AttentionPolicy
 from focusledger.services.settings import get_setting, set_setting
 
 
@@ -23,6 +24,8 @@ class AgentRunOptions:
 
 def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
     adapter = get_platform_adapter()
+    attention_policy = AttentionPolicy.from_config(config)
+    attention_policy.validate()
     sample_count = 0
     segment_gap_seconds = max(config.poll_interval_seconds * 3, 15)
 
@@ -44,6 +47,7 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
                     snapshot=snapshot,
                     segment_gap_seconds=segment_gap_seconds,
                     idle_seconds=idle_seconds,
+                    attention_policy=attention_policy,
                 )
                 write_heartbeat(conn, device_id=config.device_id)
             except Exception as exc:
@@ -72,3 +76,18 @@ def _read_idle_seconds(adapter) -> float | None:
 def request_stop(config: AppConfig) -> None:
     with connect(config.database_path) as conn:
         set_setting(conn, "agent_stop_requested", "true")
+
+
+def request_start(config: AppConfig) -> None:
+    with connect(config.database_path) as conn:
+        set_setting(conn, "agent_stop_requested", "false")
+
+
+def mark_agent_stopped(config: AppConfig, message: str) -> None:
+    with connect(config.database_path) as conn:
+        write_heartbeat(
+            conn,
+            device_id=config.device_id,
+            status="stopped",
+            message=message,
+        )

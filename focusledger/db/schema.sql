@@ -39,26 +39,6 @@ CREATE TABLE IF NOT EXISTS raw_activity_events (
 CREATE INDEX IF NOT EXISTS idx_raw_activity_events_captured_at
 ON raw_activity_events(captured_at);
 
-CREATE TABLE IF NOT EXISTS activity_segments (
-    id TEXT PRIMARY KEY,
-    device_id TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    ended_at TEXT NOT NULL,
-    duration_seconds REAL NOT NULL DEFAULT 0,
-    process_name TEXT,
-    window_title TEXT,
-    executable_path TEXT,
-    source TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_activity_segments_started_at
-ON activity_segments(started_at);
-
-CREATE INDEX IF NOT EXISTS idx_activity_segments_process_name
-ON activity_segments(process_name);
-
 CREATE TABLE IF NOT EXISTS applications (
     id TEXT PRIMARY KEY,
     process_name TEXT NOT NULL,

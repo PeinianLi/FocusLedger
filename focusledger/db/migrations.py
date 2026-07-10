@@ -4,7 +4,7 @@ from importlib.resources import files
 from sqlite3 import Connection
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 
 def apply_migrations(conn: Connection) -> None:

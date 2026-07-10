@@ -36,22 +36,37 @@ cd "C:\Work&Study\Duke\Projects\FocusLedger"
 python -m focusledger init
 ```
 
-启动持续采集：
+后台启动持续采集：
+
+```powershell
+python -m focusledger start --background
+```
+
+命令返回后，可以在同一个 PowerShell 查看状态、时间线和注意力汇总：
+
+```powershell
+python -m focusledger status
+python -m focusledger timeline --today
+python -m focusledger summary --today
+python -m focusledger attention --today
+```
+
+确认 `status: running` 且 `stale: false` 后，可以关闭当前 PowerShell，
+后台 agent 会继续运行。
+
+停止后台 agent：
+
+```powershell
+python -m focusledger stop
+```
+
+如果需要在前台调试：
 
 ```powershell
 python -m focusledger start
 ```
 
-保持这个 PowerShell 窗口打开。需要停止时，在这个窗口按 `Ctrl+C`。
-
-另开一个 PowerShell 查看当前状态和使用记录：
-
-```powershell
-cd "C:\Work&Study\Duke\Projects\FocusLedger"
-python -m focusledger status
-python -m focusledger timeline --today
-python -m focusledger summary --today
-```
+前台模式会占用当前 PowerShell，按 `Ctrl+C` 停止。
 
 只采集一次然后退出：
 
@@ -65,11 +80,8 @@ python -m focusledger start --once
 python -m focusledger start --max-samples 10
 ```
 
-从另一个终端请求正在运行的 agent 停止：
-
-```powershell
-python -m focusledger stop
-```
+注意：当前版本还没有开机自启动。电脑重启后需要重新运行
+`python -m focusledger start --background`。
 
 ## macOS 使用方式
 
@@ -78,15 +90,17 @@ python -m focusledger stop
 ```bash
 cd /path/to/FocusLedger
 python -m focusledger init
-python -m focusledger start
+python -m focusledger start --background
 ```
 
-另开一个终端查看状态和记录：
+在同一个终端查看状态和记录：
 
 ```bash
 python -m focusledger status
 python -m focusledger timeline --today
 python -m focusledger summary --today
+python -m focusledger attention --today
+python -m focusledger stop
 ```
 
 权限说明：
@@ -171,6 +185,35 @@ python -m focusledger config set poll-interval 1
 
 修改采样间隔后，需要重启 agent 才会生效。
 
+查看键盘/鼠标 attention 状态与有效时间：
+
+```bash
+python -m focusledger attention --today
+python -m focusledger attention --date 2026-07-05
+python -m focusledger attention --today --timeline
+```
+
+`attention --today` 会默认显示一条压缩的横向 attention 时间轴；加上 `--timeline`
+会继续显示每个 attention segment 的详细起止时间。
+
+查看当前 attention 阈值和权重：
+
+```bash
+python -m focusledger config attention
+```
+
+按分钟修改四个阈值（low activity、attention gap、interrupted、hard idle）：
+
+```bash
+python -m focusledger config set attention-thresholds 3 10 20 30
+```
+
+修改五个权重（active、low activity、attention gap、interrupted、hard idle）：
+
+```bash
+python -m focusledger config set attention-weights 1.0 0.5 0.0 0.0 0.0
+```
+
 清空当前数据库并重新创建 schema：
 
 ```bash
@@ -191,7 +234,7 @@ python -m focusledger privacy redact-private-browser-titles
 
 ## 浏览器隐私行为
 
-当前 Windows collector 读取的是前台窗口标题。浏览器扩展还没有实现。
+当前 collector 读取的是前台窗口标题。浏览器扩展还没有实现。
 
 当前规则：
 
@@ -215,13 +258,30 @@ python -m focusledger privacy redact-private-browser-titles
 - 权限受保护的窗口
 - Windows 短暂无法返回 foreground window
 
-当前版本还没有实现 idle/attention 检测，所以这些时间会先原样记录。后续 Phase 2 会把这类时间更自然地归入 idle、hard idle 或 away。
+当前版本已经实现 Proposal Part 10 的 Unified Attention Detector。每次采样只写入
+前台窗口信息和键盘/鼠标 idle 秒数；attention 状态、权重、activity segments 和
+attention timeline 都在查询时从原始采样推导出来，不作为派生数据长期写入数据库。
+
+默认规则：
+
+| 无输入时长 | 状态 | 权重 |
+|---:|---|---:|
+| 0-3 分钟 | `active` | 1.0 |
+| 3-10 分钟 | `low_activity` | 0.5 |
+| 10-20 分钟 | `attention_gap` | 0.0 |
+| 20-30 分钟 | `interrupted` | 0.0 |
+| 30 分钟以上 | `hard_idle` | 0.0 |
+
+`attention` 命令同时显示原始时间和按权重折算的 effective attention time。
+旧数据库会自动升级到 schema v4，不需要清空。
+
+Part 11 中“播放课程音视频时修正 attention gap”的规则尚未接入；在浏览器音频和
+内容分类完成前，10 分钟以上无输入仍按 Part 10 的保守默认规则计算。
 
 ## 当前尚未实现
 
 当前版本还没有实现：
 
-- idle / attention 检测
 - workday session
 - 浏览器 URL / audio / private mode API 采集
 - activity 分类

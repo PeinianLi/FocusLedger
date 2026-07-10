@@ -30,13 +30,16 @@ _PRIVATE_TITLE_MARKERS = (
     "private browsing",
     "(private)",
     "private window",
+    "\u65e0\u75d5",
+    "\u9690\u79c1\u6d4f\u89c8",
+    "\u96b1\u79c1\u700f\u89bd",
 )
 
 # Window handles that have already been identified as private. Once a browser
 # window is recognised as private we keep treating it as private even after its
 # title changes to something that no longer carries an obvious marker. This is
 # process-level state on purpose: the agent runs as a single long-lived process.
-_known_private_handles: set[str] = set()
+_known_private_windows: set[tuple[int | None, str]] = set()
 
 
 def _is_browser(process_name: str | None) -> bool:
@@ -64,11 +67,12 @@ def sanitize_snapshot(snapshot: ActiveWindowSnapshot) -> ActiveWindowSnapshot:
         return snapshot
 
     handle = snapshot.window_handle
+    window_key = (snapshot.process_id, handle) if handle else None
     is_private = _title_marks_private(snapshot.window_title)
 
-    if is_private and handle:
-        _known_private_handles.add(handle)
-    elif handle and handle in _known_private_handles:
+    if is_private and window_key:
+        _known_private_windows.add(window_key)
+    elif window_key and window_key in _known_private_windows:
         is_private = True
 
     if not is_private:
@@ -118,23 +122,25 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
         ).fetchall()
     ]
 
-    segment_ids = [
-        row["id"]
-        for row in conn.execute(
-            f"""
-            SELECT DISTINCT s.id
-            FROM activity_segments s
-            JOIN raw_activity_events r
-              ON r.device_id = s.device_id
-             AND r.process_name IS s.process_name
-             AND r.captured_at >= s.started_at
-             AND r.captured_at <= s.ended_at
-            WHERE r.window_handle IN ({placeholders})
-              AND (s.window_title IS NULL OR s.window_title != ?)
-            """,
-            (*handles, PRIVATE_BROWSER_TITLE),
-        ).fetchall()
-    ]
+    segment_ids = []
+    if _table_exists(conn, "activity_segments"):
+        segment_ids = [
+            row["id"]
+            for row in conn.execute(
+                f"""
+                SELECT DISTINCT s.id
+                FROM activity_segments s
+                JOIN raw_activity_events r
+                  ON r.device_id = s.device_id
+                 AND r.process_name IS s.process_name
+                 AND r.captured_at >= s.started_at
+                 AND r.captured_at <= s.ended_at
+                WHERE r.window_handle IN ({placeholders})
+                  AND (s.window_title IS NULL OR s.window_title != ?)
+                """,
+                (*handles, PRIVATE_BROWSER_TITLE),
+            ).fetchall()
+        ]
 
     for row_id in raw_ids:
         conn.execute(
@@ -155,3 +161,15 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
         "raw_activity_events": raw_redacted,
         "activity_segments": segments_redacted,
     }
+
+
+def _table_exists(conn, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None

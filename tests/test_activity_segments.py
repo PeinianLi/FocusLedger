@@ -9,13 +9,20 @@ from pathlib import Path
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
 from focusledger.models import ActiveWindowSnapshot
-from focusledger.services.activity import record_activity_snapshot, summarize_by_app
+from focusledger.services.activity import (
+    list_attention_segments,
+    list_timeline,
+    record_activity_snapshot,
+    summarize_attention,
+    summarize_by_app,
+)
+from focusledger.services.attention import AttentionPolicy
 from focusledger.services.privacy import PRIVATE_BROWSER_TITLE, redact_existing_private_browser_titles
 
 
 def make_snapshot(
     captured_at: datetime,
-    process_name: str,
+    process_name: str | None,
     title: str,
     window_handle: str = "1",
 ) -> ActiveWindowSnapshot:
@@ -54,10 +61,17 @@ class ActivitySegmentTests(unittest.TestCase):
                 segment_gap_seconds=15,
             )
 
-            rows = conn.execute("SELECT duration_seconds, process_name FROM activity_segments").fetchall()
+            rows = list_timeline(conn, base.date())
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["process_name"], "Code.exe")
             self.assertEqual(rows[0]["duration_seconds"], 5)
+            stored_segments = conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name = 'activity_segments'
+                """
+            ).fetchone()
+            self.assertIsNone(stored_segments)
             conn.close()
 
     def test_changed_title_creates_new_segment(self) -> None:
@@ -78,8 +92,31 @@ class ActivitySegmentTests(unittest.TestCase):
                 segment_gap_seconds=15,
             )
 
-            count = conn.execute("SELECT COUNT(*) AS count FROM activity_segments").fetchone()["count"]
-            self.assertEqual(count, 2)
+            rows = list_timeline(conn, base.date())
+            self.assertEqual(len(rows), 2)
+            conn.close()
+
+    def test_unknown_process_samples_merge_into_one_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 21, 35, tzinfo=timezone.utc)
+
+            for offset in range(20):
+                record_activity_snapshot(
+                    conn,
+                    device_id="device_test",
+                    snapshot=make_snapshot(
+                        base + timedelta(seconds=offset),
+                        None,
+                        "",
+                    ),
+                    segment_gap_seconds=15,
+                )
+
+            rows = list_timeline(conn, base.date())
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["process_name"], "(unknown)")
+            self.assertEqual(rows[0]["duration_seconds"], 19)
             conn.close()
 
     def test_summary_groups_by_process(self) -> None:
@@ -118,7 +155,7 @@ class ActivitySegmentTests(unittest.TestCase):
             )
 
             raw_title = conn.execute("SELECT window_title FROM raw_activity_events").fetchone()["window_title"]
-            segment_title = conn.execute("SELECT window_title FROM activity_segments").fetchone()["window_title"]
+            segment_title = list_timeline(conn, base.date())[0]["window_title"]
             self.assertEqual(raw_title, "Sensitive page title - Google Chrome")
             self.assertEqual(segment_title, "Sensitive page title - Google Chrome")
             conn.close()
@@ -145,11 +182,238 @@ class ActivitySegmentTests(unittest.TestCase):
                 row["window_title"]
                 for row in conn.execute("SELECT window_title FROM raw_activity_events ORDER BY captured_at").fetchall()
             ]
-            segments = conn.execute("SELECT window_title, duration_seconds FROM activity_segments").fetchall()
+            segments = list_timeline(conn, base.date())
             self.assertEqual(raw_titles, [PRIVATE_BROWSER_TITLE, PRIVATE_BROWSER_TITLE])
             self.assertEqual(len(segments), 1)
             self.assertEqual(segments[0]["window_title"], PRIVATE_BROWSER_TITLE)
             self.assertEqual(segments[0]["duration_seconds"], 5)
+            conn.close()
+
+    def test_chinese_incognito_title_is_redacted_and_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc)
+
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base,
+                    "chrome.exe",
+                    "\u65b0\u7684\u65e0\u75d5\u5f0f\u6807\u7b7e\u9875 - Google Chrome",
+                    "private_cn",
+                ),
+                segment_gap_seconds=15,
+            )
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(seconds=5),
+                    "chrome.exe",
+                    "Sensitive page - Google Chrome",
+                    "private_cn",
+                ),
+                segment_gap_seconds=15,
+            )
+
+            rows = list_timeline(conn, base.date())
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["window_title"], PRIVATE_BROWSER_TITLE)
+            self.assertEqual(rows[0]["duration_seconds"], 5)
+            conn.close()
+
+    def test_attention_summary_is_derived_from_raw_idle_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime.now().astimezone().replace(
+                hour=9,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            policy = AttentionPolicy(
+                low_activity_after_seconds=2,
+                attention_gap_after_seconds=3,
+                interrupted_after_seconds=4,
+                hard_idle_after_seconds=5,
+            )
+            samples = (
+                (0, 0.0),
+                (4, 4.0),
+                (10, None),
+            )
+
+            for offset, idle_seconds in samples:
+                record_activity_snapshot(
+                    conn,
+                    device_id="device_test",
+                    snapshot=make_snapshot(
+                        base + timedelta(seconds=offset),
+                        "Code.exe",
+                        "FocusLedger",
+                    ),
+                    segment_gap_seconds=15,
+                    idle_seconds=idle_seconds,
+                )
+
+            result = summarize_attention(
+                conn,
+                base.date(),
+                poll_interval_seconds=1,
+                attention_policy=policy,
+            )
+            self.assertEqual(result["active_seconds"], 2)
+            self.assertEqual(result["low_activity_seconds"], 1)
+            self.assertEqual(result["attention_gap_seconds"], 1)
+            self.assertEqual(result["unknown_seconds"], 0)
+            self.assertEqual(result["effective_seconds"], 2.5)
+            self.assertEqual(result["per_app"][0]["process_name"], "Code.exe")
+            conn.close()
+
+    def test_attention_segments_are_backfilled_from_last_input_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc)
+
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(seconds=1800),
+                    "Code.exe",
+                    "FocusLedger",
+                ),
+                segment_gap_seconds=15,
+                idle_seconds=1800,
+            )
+
+            rows = list_attention_segments(conn, base.date())
+            self.assertEqual(
+                [row["attention_state"] for row in rows],
+                [
+                    "active",
+                    "low_activity",
+                    "attention_gap",
+                    "interrupted",
+                    "hard_idle",
+                ],
+            )
+            self.assertEqual(
+                [row["duration_seconds"] for row in rows],
+                [180, 420, 600, 600, 0],
+            )
+            self.assertEqual(rows[0]["started_at"], base.isoformat())
+            self.assertEqual(
+                rows[0]["ended_at"],
+                (base + timedelta(seconds=180)).isoformat(),
+            )
+            self.assertEqual(
+                [row["attention_weight"] for row in rows],
+                [1.0, 0.5, 0.0, 0.0, 0.0],
+            )
+            conn.close()
+
+    def test_attention_segments_continue_from_previous_end_without_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 13, 0, tzinfo=timezone.utc)
+
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(minutes=1),
+                    "Code.exe",
+                    "FocusLedger",
+                ),
+                segment_gap_seconds=15,
+                idle_seconds=60,
+            )
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(minutes=4),
+                    "Code.exe",
+                    "FocusLedger",
+                ),
+                segment_gap_seconds=15,
+                idle_seconds=240,
+            )
+
+            rows = list_attention_segments(conn, base.date())
+            self.assertEqual(
+                [row["attention_state"] for row in rows],
+                ["active", "low_activity"],
+            )
+            self.assertEqual(rows[0]["started_at"], base.isoformat())
+            self.assertEqual(
+                rows[0]["ended_at"],
+                (base + timedelta(minutes=3)).isoformat(),
+            )
+            self.assertEqual(
+                rows[1]["started_at"],
+                (base + timedelta(minutes=3)).isoformat(),
+            )
+            self.assertEqual(
+                rows[1]["ended_at"],
+                (base + timedelta(minutes=4)).isoformat(),
+            )
+            self.assertEqual(
+                [row["duration_seconds"] for row in rows],
+                [180, 60],
+            )
+            conn.close()
+
+    def test_next_input_rewrites_long_idle_gap_as_hard_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 13, 0, tzinfo=timezone.utc)
+
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(base, "Code.exe", "FocusLedger"),
+                segment_gap_seconds=15,
+                idle_seconds=0,
+            )
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(minutes=30),
+                    "Code.exe",
+                    "FocusLedger",
+                ),
+                segment_gap_seconds=15,
+                idle_seconds=1800,
+            )
+            record_activity_snapshot(
+                conn,
+                device_id="device_test",
+                snapshot=make_snapshot(
+                    base + timedelta(hours=1),
+                    "Code.exe",
+                    "FocusLedger",
+                ),
+                segment_gap_seconds=15,
+                idle_seconds=0,
+            )
+
+            rows = list_attention_segments(conn, base.date())
+            self.assertEqual(
+                [(row["attention_state"], row["duration_seconds"]) for row in rows],
+                [
+                    ("hard_idle", 3600),
+                    ("active", 0),
+                ],
+            )
+            self.assertEqual(rows[0]["started_at"], base.isoformat())
+            self.assertEqual(
+                rows[0]["ended_at"],
+                (base + timedelta(hours=1)).isoformat(),
+            )
             conn.close()
 
     def test_existing_private_browser_titles_can_be_redacted(self) -> None:
@@ -169,6 +433,23 @@ class ActivitySegmentTests(unittest.TestCase):
                     base.isoformat(),
                     base.isoformat(),
                 ),
+            )
+            conn.execute(
+                """
+                CREATE TABLE activity_segments (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL DEFAULT 0,
+                    process_name TEXT,
+                    window_title TEXT,
+                    executable_path TEXT,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
             conn.execute(
                 """
