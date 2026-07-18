@@ -30,6 +30,7 @@ from focusledger.services.activity import (
 from focusledger.services.attention import AttentionPolicy
 from focusledger.services.dev import reset_database
 from focusledger.services.privacy import redact_existing_private_browser_titles
+from focusledger.services.report import build_report_data, render_report_html
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -119,6 +120,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show continuous attention-state segments.",
     )
     attention_parser.set_defaults(func=cmd_attention)
+
+    report_parser = subparsers.add_parser(
+        "report", help="Generate an interactive HTML report for a day."
+    )
+    add_date_args(report_parser)
+    report_parser.add_argument(
+        "--output",
+        dest="output",
+        default=None,
+        help="Output HTML path (default: <data_dir>/report-<date>.html).",
+    )
+    report_parser.set_defaults(func=cmd_report)
 
     privacy_parser = subparsers.add_parser("privacy", help="Privacy maintenance helpers.")
     privacy_subparsers = privacy_parser.add_subparsers(required=True)
@@ -476,6 +489,28 @@ def attention_timeline_legend(symbols: dict[str, str]) -> str:
         f"{symbols['hard_idle']} hard_idle | "
         f"{symbols['unknown']} unknown"
     )
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    day = parse_target_date(args)
+    policy = AttentionPolicy.from_config(cfg)
+    with connect(cfg.database_path) as conn:
+        data = build_report_data(conn, day, cfg.poll_interval_seconds, policy)
+    html = render_report_html(data)
+
+    if args.output:
+        output_path = Path(args.output).expanduser()
+    else:
+        output_path = cfg.data_dir / f"report-{day.isoformat()}.html"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+
+    segments = len(data["attention"]["segments"])  # type: ignore[index]
+    print(f"Wrote FocusLedger report for {day}.")
+    print(f"  segments: {segments}")
+    print(f"  output: {output_path}")
+    print(f"  open: file://{output_path.resolve()}")
 
 
 def cmd_privacy_redact_browser_titles(args: argparse.Namespace) -> None:

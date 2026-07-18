@@ -20,4 +20,4 @@ focusledger = "focusledger.cli:main"
 include = ["focusledger*"]
 
 [tool.setuptools.package-data]
-focusledger = ["db/schema.sql"]
+focusledger = ["db/schema.sql", "report/template.html"]
