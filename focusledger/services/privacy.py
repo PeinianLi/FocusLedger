@@ -86,61 +86,59 @@ def sanitize_snapshot(snapshot: ActiveWindowSnapshot) -> ActiveWindowSnapshot:
 def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
     """Redact private/incognito browser titles already stored in the database.
 
-    Identifies private browser window handles from raw_activity_events (browser
-    process + private title marker), then redacts those raw events as well as the
-    activity segments that overlap them in time.
+    Two rules apply, matching what each collector is able to observe:
+
+    * Events that carry a window handle (Windows, macOS pyobjc backend): find the
+      handles ever seen with a private title marker, then redact every event for
+      those handles plus the activity segments overlapping them in time.
+    * Events without a handle (macOS subprocess backend): separate windows cannot
+      be told apart, so the sticky per-window rule has nothing to key on. Only
+      events whose own title still carries a marker can be redacted.
     """
-    rows = conn.execute(
-        "SELECT window_handle, process_name, window_title FROM raw_activity_events"
-    ).fetchall()
+    private_handles = _private_window_handles(conn)
 
-    private_handles = {
-        row["window_handle"]
-        for row in rows
-        if row["window_handle"]
-        and _is_browser(row["process_name"])
-        and _title_marks_private(row["window_title"])
-    }
+    raw_ids: list[str] = []
+    segment_ids: list[str] = []
 
-    raw_redacted = 0
-    segments_redacted = 0
-    if not private_handles:
-        return {"raw_activity_events": 0, "activity_segments": 0}
+    if private_handles:
+        placeholders = ",".join("?" for _ in private_handles)
+        handles = list(private_handles)
 
-    placeholders = ",".join("?" for _ in private_handles)
-    handles = list(private_handles)
-
-    raw_ids = [
-        row["id"]
-        for row in conn.execute(
-            f"""
-            SELECT id FROM raw_activity_events
-            WHERE window_handle IN ({placeholders})
-              AND (window_title IS NULL OR window_title != ?)
-            """,
-            (*handles, PRIVATE_BROWSER_TITLE),
-        ).fetchall()
-    ]
-
-    segment_ids = []
-    if _table_exists(conn, "activity_segments"):
-        segment_ids = [
+        raw_ids = [
             row["id"]
             for row in conn.execute(
                 f"""
-                SELECT DISTINCT s.id
-                FROM activity_segments s
-                JOIN raw_activity_events r
-                  ON r.device_id = s.device_id
-                 AND r.process_name IS s.process_name
-                 AND r.captured_at >= s.started_at
-                 AND r.captured_at <= s.ended_at
-                WHERE r.window_handle IN ({placeholders})
-                  AND (s.window_title IS NULL OR s.window_title != ?)
+                SELECT id FROM raw_activity_events
+                WHERE window_handle IN ({placeholders})
+                  AND (window_title IS NULL OR window_title != ?)
                 """,
                 (*handles, PRIVATE_BROWSER_TITLE),
             ).fetchall()
         ]
+
+        if _table_exists(conn, "activity_segments"):
+            segment_ids = [
+                row["id"]
+                for row in conn.execute(
+                    f"""
+                    SELECT DISTINCT s.id
+                    FROM activity_segments s
+                    JOIN raw_activity_events r
+                      ON r.device_id = s.device_id
+                     AND r.process_name IS s.process_name
+                     AND r.captured_at >= s.started_at
+                     AND r.captured_at <= s.ended_at
+                    WHERE r.window_handle IN ({placeholders})
+                      AND (s.window_title IS NULL OR s.window_title != ?)
+                    """,
+                    (*handles, PRIVATE_BROWSER_TITLE),
+                ).fetchall()
+            ]
+
+    raw_ids.extend(_private_handleless_raw_ids(conn))
+
+    raw_redacted = 0
+    segments_redacted = 0
 
     for row_id in raw_ids:
         conn.execute(
@@ -161,6 +159,35 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
         "raw_activity_events": raw_redacted,
         "activity_segments": segments_redacted,
     }
+
+
+def _private_window_handles(conn: Connection) -> set[str]:
+    rows = conn.execute(
+        "SELECT window_handle, process_name, window_title FROM raw_activity_events"
+    ).fetchall()
+    return {
+        row["window_handle"]
+        for row in rows
+        if row["window_handle"]
+        and _is_browser(row["process_name"])
+        and _title_marks_private(row["window_title"])
+    }
+
+
+def _private_handleless_raw_ids(conn: Connection) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT id, process_name, window_title FROM raw_activity_events
+        WHERE window_handle IS NULL
+          AND (window_title IS NULL OR window_title != ?)
+        """,
+        (PRIVATE_BROWSER_TITLE,),
+    ).fetchall()
+    return [
+        row["id"]
+        for row in rows
+        if _is_browser(row["process_name"]) and _title_marks_private(row["window_title"])
+    ]
 
 
 def _table_exists(conn, table_name: str) -> bool:
