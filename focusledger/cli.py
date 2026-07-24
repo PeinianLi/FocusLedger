@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import webbrowser
 import os
 import subprocess
 import sys
@@ -30,6 +31,8 @@ from focusledger.services.activity import (
 from focusledger.services.attention import AttentionPolicy
 from focusledger.services.dev import reset_database
 from focusledger.services.privacy import redact_existing_private_browser_titles
+from focusledger.cli_support import ensure_initialized as _ensure_initialized
+from focusledger.server.app import create_server, serve_forever
 from focusledger.services.report import build_report_data, render_report_html
 
 
@@ -122,14 +125,27 @@ def build_parser() -> argparse.ArgumentParser:
     attention_parser.set_defaults(func=cmd_attention)
 
     report_parser = subparsers.add_parser(
-        "report", help="Generate an interactive HTML report for a day."
+        "report", help="Serve an interactive live report at http://127.0.0.1."
     )
     add_date_args(report_parser)
     report_parser.add_argument(
-        "--output",
-        dest="output",
+        "--port",
+        dest="port",
+        type=int,
+        default=0,
+        help="Port to listen on (default: an available port chosen by the OS).",
+    )
+    report_parser.add_argument(
+        "--no-open",
+        dest="no_open",
+        action="store_true",
+        help="Print the URL without opening a browser.",
+    )
+    report_parser.add_argument(
+        "--export",
+        dest="export",
         default=None,
-        help="Output HTML path (default: <data_dir>/report-<date>.html).",
+        help="Write a standalone snapshot HTML file instead of serving.",
     )
     report_parser.set_defaults(func=cmd_report)
 
@@ -140,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Redact private/incognito browser window titles already stored in the local database.",
     )
     redact_parser.set_defaults(func=cmd_privacy_redact_browser_titles)
+
+    from focusledger.commands import REGISTRARS
+    for register in REGISTRARS:
+        register(subparsers)
 
     dev_parser = subparsers.add_parser("dev", help="Development and testing helpers.")
     dev_subparsers = dev_parser.add_subparsers(required=True)
@@ -494,22 +514,32 @@ def attention_timeline_legend(symbols: dict[str, str]) -> str:
 def cmd_report(args: argparse.Namespace) -> None:
     cfg = ensure_initialized()
     day = parse_target_date(args)
+
+    if args.export:
+        _export_report(cfg, day, Path(args.export).expanduser())
+        return
+
+    server = create_server(cfg, day, port=args.port)
+    url = server.url
+    print("FocusLedger report server running.")
+    print(f"  url: {url}")
+    print(f"  date: {day} (live — follows today as it is collected)")
+    print("  press Ctrl+C to stop")
+    if not args.no_open:
+        webbrowser.open(url)
+    serve_forever(server)
+    print("\nReport server stopped.")
+
+
+def _export_report(cfg, day, output_path: Path) -> None:
     policy = AttentionPolicy.from_config(cfg)
     with connect(cfg.database_path) as conn:
-        data = build_report_data(conn, day, cfg.poll_interval_seconds, policy)
-    html = render_report_html(data)
-
-    if args.output:
-        output_path = Path(args.output).expanduser()
-    else:
-        output_path = cfg.data_dir / f"report-{day.isoformat()}.html"
+        data = build_report_data(conn, day, cfg.poll_interval_seconds, policy, cfg)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html, encoding="utf-8")
-
+    output_path.write_text(render_report_html(data), encoding="utf-8")
     segments = len(data["attention"]["segments"])  # type: ignore[index]
-    print(f"Wrote FocusLedger report for {day}.")
+    print(f"Exported FocusLedger snapshot for {day}.")
     print(f"  segments: {segments}")
-    print(f"  output: {output_path}")
     print(f"  open: file://{output_path.resolve()}")
 
 
@@ -542,10 +572,7 @@ def cmd_dev_reset_db(args: argparse.Namespace) -> None:
 
 
 def ensure_initialized():
-    cfg = ensure_config()
-    with connect(cfg.database_path) as conn:
-        apply_migrations(conn)
-    return load_config()
+    return _ensure_initialized()
 
 
 def launch_background_agent(cfg: AppConfig) -> None:

@@ -47,3 +47,130 @@ CREATE TABLE IF NOT EXISTS applications (
     last_seen_at TEXT NOT NULL,
     UNIQUE(process_name, executable_path)
 );
+
+-- ---------------------------------------------------------------------------
+-- Phase 3-8 tables.
+--
+-- Only facts and user input are stored here. Anything that can be recomputed
+-- from raw events (classifications, missing-data intervals, category totals,
+-- deliverable time attribution) stays derived at query time, so changing a
+-- rule or threshold re-explains history instead of leaving stale rows behind.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS workday_sessions (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    workday_key TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    timezone TEXT,
+    status TEXT NOT NULL,
+    is_overtime INTEGER NOT NULL DEFAULT 0,
+    offwork_target_time TEXT,
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workday_sessions_key
+    ON workday_sessions(device_id, workday_key);
+
+CREATE TABLE IF NOT EXISTS workday_pauses (
+    id TEXT PRIMARY KEY,
+    workday_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workday_pauses_workday
+    ON workday_pauses(workday_id, started_at);
+
+CREATE TABLE IF NOT EXISTS classification_rules (
+    id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    match_type TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    category TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manual_corrections (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    category TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_corrections_target
+    ON manual_corrections(scope, pattern);
+
+CREATE TABLE IF NOT EXISTS deliverables (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    priority INTEGER NOT NULL DEFAULT 2,
+    due_date TEXT,
+    match_keywords TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    deliverable_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    estimate_minutes INTEGER,
+    blocker TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_deliverable ON tasks(deliverable_id);
+
+CREATE TABLE IF NOT EXISTS daily_notes (
+    id TEXT PRIMARY KEY,
+    workday_key TEXT NOT NULL,
+    progress TEXT,
+    blocked TEXT,
+    tomorrow TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_notes_key ON daily_notes(workday_key);
+
+CREATE TABLE IF NOT EXISTS distraction_events (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    workday_key TEXT,
+    detected_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    category TEXT,
+    process_name TEXT,
+    duration_seconds REAL,
+    reason TEXT,
+    labeled_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_distraction_events_day
+    ON distraction_events(workday_key, detected_at);
+
+CREATE TABLE IF NOT EXISTS daily_reviews (
+    id TEXT PRIMARY KEY,
+    workday_key TEXT NOT NULL,
+    markdown TEXT NOT NULL,
+    generator TEXT NOT NULL,
+    llm_status TEXT NOT NULL,
+    llm_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_reviews_key ON daily_reviews(workday_key);

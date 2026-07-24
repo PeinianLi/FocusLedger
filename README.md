@@ -1,6 +1,6 @@
 # FocusLedger
 
-FocusLedger 是一个本地优先的个人生产力审计工具。当前版本是 terminal-first 的早期 MVP，重点验证本地采集、原始事件存储、时间线推导和 attention 估算这条基础链路，并提供一个可交互的单文件 HTML 日报表用于可视化复盘。
+FocusLedger 是一个本地优先的个人生产力审计工具。当前版本完成了提案 Phase 0-9 的 MVP：本地采集、attention 估算、workday 模型、活动分类、deliverable 追踪、分心提醒、本地 LLM 日报、开机自启，以及一个实时的浏览器仪表台。所有数据只存在本机 SQLite，不上传任何服务器。
 
 ## 文档入口
 
@@ -17,21 +17,22 @@ README 只保留项目级说明；具体命令、日常操作和排查步骤统�
 启动 agent
 -> 采集当前前台窗口和键盘/鼠标 idle 秒数
 -> 写入 SQLite 原始事件
--> 查询时推导 activity timeline / app summary / attention timeline
--> report 命令渲染当天数据为可交互 HTML 仪表台
--> 通过 heartbeat/status 检查运行状态
+-> 查询时推导 activity timeline / attention / 分类 / deliverable 归因 / missing data
+-> 分心达阈值时本地提醒并记录，等你标注原因
+-> 下班后收集手写进展，本地小模型生成日报和明日计划
+-> report 命令起本地服务，浏览器实时查看可交互仪表台
 ```
 
-新版本只把原始采样作为长期事实写入数据库。以下内容都是查询时从原始采样推导出来的，不作为派生数据长期写入：
+**只有事实和你的输入会落库**：原始采样、workday 会话、deliverable/task、手动分类修正、
+分心原因、日报。以下内容一律在查询时推导，不作为派生数据长期写入：
 
 ```text
-activity segments
-attention segments
-attention_state
-attention_weight
+activity segments        attention_state / attention_weight
+attention segments       活动分类（category）
+missing data intervals   deliverable 时间归因
 ```
 
-这样后续修改分类规则或 attention 阈值时，旧数据可以按新规则重新计算。
+因此改一条分类规则或 attention 阈值时，历史数据会按新规则重新解释，而不会留下过期的旧结论。
 
 ## 平台支持状态
 
@@ -80,17 +81,35 @@ attention_weight
 
 Part 11 中“播放课程音视频时修正 attention gap”的规则尚未接入；在浏览器音频和内容分类完成前，长时间无输入仍按 Part 10 的保守规则计算。
 
+## 本地 LLM
+
+日报的自然语言部分由**本机运行的小模型**生成，走 Ollama 的 HTTP 接口（默认 `127.0.0.1:11434`），
+数据不出机器，也不产生任何 API 费用。项目本身**不增加任何 Python 依赖**，只用标准库发请求。
+
+```bash
+# 安装 Ollama 后拉一个小模型即可（1-3B 就够用）
+ollama pull qwen2.5:1.5b
+python -m focusledger llm status
+```
+
+没有装模型也完全不影响使用：日报会自动降级为确定性的规则版本，客观统计一字不少。
+
+设计上有一条硬边界：**模型只负责写评述文字，绝不参与任何计算**。所有数字都在 Python 里算好后
+才交给模型，因此即使用 0.5B 的模型也不会出现算错时间的情况，最多是措辞弱一些。
+
 ## 可视化报告
 
-`focusledger report` 把某一天的原始采样渲染成一个自包含的 HTML 仪表台（内联数据/样式/脚本，无网络依赖，直接用浏览器打开）。主要内容：
+`focusledger report` 会在本机启动一个只监听 `127.0.0.1` 的报告服务并打开浏览器（`http://127.0.0.1:<port>/`）。页面是实时的：每次请求都从原始采样重新推导，agent 采到新数据后网页自动更新，且保留当前缩放位置。
+
+前端是 React 18，通过 vendored UMD 构建 + htm 模板直接运行，**不需要 Node、npm 或任何构建步骤**。`--export` 可以把同一套界面连同数据内联成一个离线单文件 HTML 快照。主要内容：
 
 - **Focus Skyline**：注意力时间线，柱高 = attention 权重，颜色 = 状态；长时间空闲直接标注在图上。
 - **专注密度条**：每 15 分钟的有效专注比例，一眼看出全天节奏。
 - **应用泳道**：每个应用一条泳道，展示前台切换模式。
 - **深度工作 sessions**：自动检测 ≥25 分钟的持续投入段，点击可缩放跳转。
-- **交互**：滚轮缩放（最小视窗 30 分钟）、拖拽平移、shift+框选、minimap 导航、十字准线 + 悬停详情；下方统计面板随可见范围实时聚合。
+- **交互**：滚轮缩放（可深入到 2 分钟视窗）、快捷档位、拖拽平移、shift+框选、minimap 导航、十字准线 + 悬停详情；下方统计面板随可见范围实时聚合。
 
-报告与其他查询命令一样在生成时从原始采样推导，不落库。具体用法见 CLI 操作手册。
+报告与其他查询命令一样在请求时从原始采样推导，不落库。具体用法见 CLI 操作手册。
 
 ## 隐私行为
 
@@ -120,15 +139,25 @@ macOS 上没有 PyObjC 时会退化到 subprocess 采集路径，这条路径拿
 
 连续 `(unknown)` 样本会在查询时合并成连续段。若同时存在长时间无键鼠输入，attention 查询会按 idle 规则把这段解释为 `hard_idle`。
 
+## 功能总览
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Phase 0-2 | 采集骨架、Windows/macOS 前台窗口、idle 与 attention 推导 | 已完成 |
+| Phase 3 | Workday 模型（start/pause/overtime/跨午夜/missing data） | 已完成 |
+| Phase 4 | 浏览器上下文（窗口标题解析出站点与页面） | 已完成（标题解析路线） |
+| Phase 5 | 活动分类（11 类，规则优先级链 + 手动修正） | 已完成 |
+| Phase 6 | Deliverable / Task 管理与时间归因 | 已完成 |
+| Phase 7 | 分心提醒、cooldown、原因标注 | 已完成 |
+| Phase 8 | 本地 LLM 日报与明日计划（无模型时规则降级） | 已完成 |
+| Phase 9 | 开机自启（launchd / 计划任务 / systemd） | 已完成 |
+
 ## 当前尚未实现
 
-- workday session
-- 浏览器 URL / audio / private mode API 采集
-- activity 分类
-- 分心提醒
-- LLM 日报
-- Markdown journal
+- 浏览器扩展（完整 URL、音频播放状态、无痕 API）——当前只做窗口标题解析
 - Linux active window / idle 采集
+- system tray 常驻图标
+- 多设备同步、OCR、手机端
 
 ## 测试
 

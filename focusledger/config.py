@@ -33,6 +33,20 @@ class AppConfig:
     device_id: str
     language: str
     timezone: str
+    # Phase 3: workday boundaries
+    default_start_time: str
+    default_offwork_time: str
+    max_workday_hours: float
+    # Phase 7: distraction alerts
+    audio_enabled: bool
+    notification_cooldown_seconds: int
+    gaming_alert_minutes: float
+    entertainment_alert_minutes: float
+    # Phase 8: local LLM (Ollama-compatible HTTP endpoint)
+    llm_enabled: bool
+    llm_base_url: str
+    llm_model: str
+    llm_timeout_seconds: int
 
     def to_json_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -84,6 +98,17 @@ def build_default_config(data_dir: Path | None = None) -> AppConfig:
         device_id=f"device_{uuid.uuid4().hex[:12]}",
         language="zh",
         timezone=detect_timezone(),
+        default_start_time="09:00",
+        default_offwork_time="18:00",
+        max_workday_hours=16.0,
+        audio_enabled=True,
+        notification_cooldown_seconds=900,
+        gaming_alert_minutes=10.0,
+        entertainment_alert_minutes=15.0,
+        llm_enabled=True,
+        llm_base_url="http://127.0.0.1:11434",
+        llm_model="qwen2.5:1.5b",
+        llm_timeout_seconds=120,
     )
 
 
@@ -126,6 +151,17 @@ def load_config() -> AppConfig:
         device_id=str(merged["device_id"]),
         language=str(merged["language"]),
         timezone=str(merged["timezone"]),
+        default_start_time=str(merged["default_start_time"]),
+        default_offwork_time=str(merged["default_offwork_time"]),
+        max_workday_hours=float(merged["max_workday_hours"]),
+        audio_enabled=bool(merged["audio_enabled"]),
+        notification_cooldown_seconds=int(merged["notification_cooldown_seconds"]),
+        gaming_alert_minutes=float(merged["gaming_alert_minutes"]),
+        entertainment_alert_minutes=float(merged["entertainment_alert_minutes"]),
+        llm_enabled=bool(merged["llm_enabled"]),
+        llm_base_url=str(merged["llm_base_url"]),
+        llm_model=str(merged["llm_model"]),
+        llm_timeout_seconds=int(merged["llm_timeout_seconds"]),
     )
 
 

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from focusledger.cli import build_parser, heartbeat_age_seconds, render_attention_timeline
 from focusledger.config import build_default_config, load_config
 from focusledger.db.connection import connect
-from focusledger.db.migrations import apply_migrations
+from focusledger.db.migrations import SCHEMA_VERSION, apply_migrations
 
 
 class MigrationAndCliTests(unittest.TestCase):
@@ -60,7 +60,7 @@ class MigrationAndCliTests(unittest.TestCase):
             self.assertNotIn("attention_state", columns)
             self.assertNotIn("attention_weight", columns)
             self.assertIsNone(attention_table)
-            self.assertEqual(version, "4")
+            self.assertEqual(version, SCHEMA_VERSION)
 
     def test_start_parser_accepts_background(self) -> None:
         args = build_parser().parse_args(["start", "--background"])

@@ -13,7 +13,6 @@ from focusledger.db.migrations import apply_migrations
 from focusledger.models import ActiveWindowSnapshot
 from focusledger.services.activity import record_activity_snapshot
 from focusledger.services.report import (
-    DATA_TOKEN,
     build_report_data,
     render_report_html,
 )
@@ -67,7 +66,10 @@ class BuildReportDataTests(unittest.TestCase):
 
             self.assertEqual(
                 sorted(data.keys()),
-                ["activity", "attention", "attention_per_app", "meta"],
+                [
+                    "activity", "attention", "attention_per_app", "categories",
+                    "deliverables", "distractions", "meta", "review", "workday",
+                ],
             )
             att = data["attention"]
             self.assertIn("totals", att)
@@ -128,12 +130,18 @@ class RenderReportHtmlTests(unittest.TestCase):
             conn.close()
             return data
 
-    def test_token_is_replaced_and_json_round_trips(self) -> None:
+    def test_export_inlines_app_and_data(self) -> None:
         data = self.base_data()
         html = render_report_html(data)
-        self.assertNotIn(DATA_TOKEN, html)
         parsed = embedded_json(html)
         self.assertEqual(parsed["meta"]["date"], data["meta"]["date"])
+        # The snapshot must carry the whole UI so it opens with no network.
+        self.assertIn("<div id=\"root\">", html)
+        self.assertIn("createElement", html)   # vendored React
+        self.assertIn("FOCUS", html)           # the app itself
+        # Nothing may be loaded from outside the file: no external script/link tags.
+        self.assertIsNone(re.search(r"<script[^>]*\ssrc=", html))
+        self.assertIsNone(re.search(r"<link[^>]*\shref=", html))
 
     def test_angle_bracket_in_title_cannot_break_out_of_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

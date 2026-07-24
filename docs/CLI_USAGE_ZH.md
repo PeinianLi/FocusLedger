@@ -182,19 +182,44 @@ unknown          无法读取 idle 信息
 
 注意：当前版本只把原始采样写入数据库。`timeline`、`summary`、`attention` 都是在查询时从 raw events 推导出来的。
 
-## 8. 生成可视化 HTML 报告
+## 8. 打开可视化报告（本地网页）
 
-把某一天的数据渲染成一个可交互的深色仪表台网页：
+启动本地报告服务并自动打开浏览器：
 
 ```bash
 python -m focusledger report --today
-python -m focusledger report --date 2026-07-16
-python -m focusledger report --today --output ~/Desktop/focus-today.html
 ```
 
-不带 `--output` 时，默认写到 `<data_dir>/report-<date>.html`。命令会打印一个 `file://` 链接，用浏览器打开即可（macOS 上也可以直接 `open` 该文件）。
+输出类似：
 
-报告是完全自包含的单个 HTML 文件（内联数据、样式和脚本，不依赖网络或第三方库），所有派生视图都在生成时从原始采样推导，不落库。
+```text
+FocusLedger report server running.
+  url: http://127.0.0.1:53127/
+  date: 2026-07-18 (live — follows today as it is collected)
+  press Ctrl+C to stop
+```
+
+页面是**实时**的：agent 每采一批新数据，网页会自动刷新内容，**并且保留你当前的缩放位置**。不需要重新跑命令。`Ctrl+C` 停止服务。
+
+常用参数：
+
+```bash
+python -m focusledger report --today --port 8765     # 固定端口
+python -m focusledger report --today --no-open       # 只打印 URL，不自动开浏览器
+python -m focusledger report --date 2026-07-16       # 看历史某天（非实时）
+```
+
+服务只监听 `127.0.0.1`（本机回环），局域网内其他设备无法访问，个人注意力数据不会离开这台机器。
+
+### 导出静态快照
+
+需要归档或发给别人时，导出一个自包含的单文件 HTML（内联全部数据、样式和脚本，离线可开）：
+
+```bash
+python -m focusledger report --date 2026-07-16 --export ~/Desktop/focus-0716.html
+```
+
+快照跑的是和实时页面同一套前端代码，只是数据固定、不再自动刷新。
 
 页面内容：
 
@@ -212,18 +237,140 @@ Deep Work     自动检测的 ≥25 分钟持续投入段，点击可缩放跳�
 交互操作：
 
 ```text
-滚轮          以光标为锚缩放（最小视窗 30 分钟）
+滚轮          以光标为锚缩放（可一直放大到 2 分钟视窗）
+15m/1h/3h/Day 一键跳到该时间跨度（实时模式下以“现在”为中心）
 拖拽          平移
 shift + 拖拽  框选一段区间并放大
 minimap       拖动视窗框平移；在空白处框选放大
-双击 / Reset / Esc / 0   回到全天
+双击 / Esc / 0  回到全天
 ← →           平移      + −   缩放
-悬停          十字准线 + 时间气泡 + 浮动详情（状态、权重、该段时长、应用、窗口标题）
+悬停          十字准线 + 浮动详情（状态、权重、该段时长、应用、该段分钟数、窗口标题）
 图例点击      隔离某个 attention 状态
 应用排行悬停  高亮该应用在泳道中的所有段
 ```
 
-## 9. 修改采样间隔
+实时模式下还有两个行为：时间轴上有一条青色虚线标记“现在”；如果你的视窗停在最右侧，新数据到达时会自动跟随推进（类似行情图的跟盘），一旦你手动往回拖就不再自动跟随。
+
+
+## 9. Workday（工作日边界）
+
+日报按你真实的工作周期切分，而不是按自然日。跨午夜的工作仍归属开始那天。
+
+```bash
+python -m focusledger workday start        # 上班
+python -m focusledger workday pause --reason lunch
+python -m focusledger workday resume
+python -m focusledger workday overtime     # 过了下班时间但继续做
+python -m focusledger workday offwork      # 下班
+python -m focusledger workday status
+python -m focusledger workday list
+```
+
+假期不会催你写日报：
+
+```bash
+python -m focusledger workday mark-holiday --date 2026-10-01
+python -m focusledger workday mark-vacation --date 2026-10-02
+```
+
+`status` 会显示 **missing data**——agent 没在跑的时间段。这是从 heartbeat 空档推导出来的，
+日报里也会显示，避免你误以为统计是完整的。
+
+## 10. 活动分类
+
+把时间归入 11 个类别（核心生产力 / 学习 / 泛知识 / 行政 / 娱乐 / 游戏 / 社交 / 沟通 等）。
+
+```bash
+python -m focusledger classify summary --today     # 每类用了多久
+python -m focusledger classify timeline --today    # 逐段看判定结果和依据
+python -m focusledger classify unknown --today     # 哪些没分出来，按时长排序
+python -m focusledger classify categories          # 列出所有类别
+```
+
+分类不满意就手动修正，**修正会重新解释历史数据**（分类是查询时推导的）：
+
+```bash
+python -m focusledger classify correct process "obsidian" productive_core
+python -m focusledger classify correct site "youtube.com" learning_general
+python -m focusledger classify correct title_keyword "标书" admin
+python -m focusledger classify corrections     # 看已有修正
+python -m focusledger classify uncorrect process "obsidian"
+```
+
+判定优先级：手动修正 → deliverable 关联 → 站点规则 → 应用规则 → 标题关键词 → unknown。
+所以 YouTube 上的讲座会算成学习，游戏实况会算成娱乐。
+
+## 11. Deliverable 与 Task
+
+FocusLedger 关心的不是"忙了多久"，而是"真正重要的事推进了没有"。
+
+```bash
+python -m focusledger deliverable add "FocusLedger MVP" --priority 1 --keywords focusledger,pycharm
+python -m focusledger deliverable list --today      # 带今天在每项上花的时间
+python -m focusledger deliverable update <id> --due 2026-08-01
+python -m focusledger deliverable done <id>
+```
+
+`--keywords` 是自动归因的依据：关键词出现在应用名或窗口标题里，这段时间就算到该 deliverable 上。
+
+```bash
+python -m focusledger task add "Wire Phase 8 review" --deliverable FocusLedger --estimate 90
+python -m focusledger task list --open
+python -m focusledger task done <id>
+python -m focusledger task block <id> "等对方给数据"
+```
+
+## 12. 分心提醒
+
+agent 在 workday 进行中会监测持续的娱乐/游戏时段，超过阈值就本地通知一次（有 cooldown，不会连环打断），
+并记录成事件等你说明原因——**没有原因的"分心"只是羞辱，不是信息**。
+
+```bash
+python -m focusledger distraction list --today
+python -m focusledger distraction reasons
+python -m focusledger distraction label <id> rabbit_hole
+```
+
+阈值和 cooldown 在配置文件里：`gaming_alert_minutes`、`entertainment_alert_minutes`、
+`notification_cooldown_seconds`、`audio_enabled`。
+
+## 13. 本地 LLM
+
+日报的文字部分由本机小模型生成，走 Ollama 接口，数据不出机器、零费用、零 Python 依赖。
+
+```bash
+python -m focusledger llm status      # 检查是否可用，并给出安装指引
+python -m focusledger llm test        # 发一句话测试
+```
+
+启用方式：装 [Ollama](https://ollama.com/download) → `ollama pull qwen2.5:1.5b` → 完成。
+换模型改配置 `llm_model` 即可（`qwen2.5:3b`、`qwen3:1.7b`、`llama3.2:1b`、`gemma2:2b` 都行）。
+
+**没装也能用**：日报自动降级成确定性的规则版本，客观统计完全一致。
+
+## 14. 日报与明日计划
+
+```bash
+python -m focusledger review write        # 先记录你自己的进展（系统看不出真实产出）
+python -m focusledger review generate     # 生成日报
+python -m focusledger review show
+python -m focusledger review list
+python -m focusledger review pending      # 哪几天还欠日报
+python -m focusledger review generate --no-llm   # 强制用规则版
+```
+
+日报保存为 markdown，同时写到 `<data_dir>/journal/<日期>.md`。结构包含：workday 范围、客观统计、
+deliverable 进展、注意力与分心、复盘、明日计划、missing data、待修正的分类。
+
+## 15. 开机自启
+
+```bash
+python -m focusledger autostart install     # macOS launchd / Windows 计划任务 / Linux systemd
+python -m focusledger autostart status
+python -m focusledger autostart uninstall
+```
+
+## 16. 修改采样间隔
 
 查看当前采样间隔可以通过 `status` 或配置文件判断。设置为 1 秒：
 
@@ -238,7 +385,7 @@ python -m focusledger stop
 python -m focusledger start --background
 ```
 
-## 10. 查看和修改 Attention 配置
+## 17. 查看和修改 Attention 配置
 
 查看当前阈值和权重：
 
@@ -264,7 +411,7 @@ python -m focusledger config set attention-weights 1.0 0.5 0.0 0.0 0.0
 active low_activity attention_gap interrupted hard_idle
 ```
 
-## 11. 隐私维护
+## 18. 隐私维护
 
 对已经写入数据库的无痕/隐私浏览器标题重新脱敏：
 
@@ -281,7 +428,7 @@ python -m focusledger privacy redact-private-browser-titles
 
 macOS 数据的特殊情况：如果这些记录来自没有 PyObjC 时的 subprocess 采集路径（`window_handle` 为空），该命令只能脱敏那些标题本身仍带 Incognito/隐私标记的行；同一无痕窗口导航后产生的、标题已不带标记的历史记录无法靠这个命令找回并脱敏。这不是命令的 bug，而是数据本身缺少可用于关联同一窗口的句柄信息。
 
-## 12. 测试阶段清空数据库
+## 19. 测试阶段清空数据库
 
 查看将要清空的数据库路径，但不删除：
 
@@ -297,13 +444,20 @@ python -m focusledger dev reset-db --yes
 
 这个命令会删除本地 SQLite 数据库，适合测试阶段重新跑数据。
 
-## 13. 常见工作流
+## 20. 常见工作流
 
-日常启动：
+一次性设置（只做一次）：
 
 ```bash
-python -m focusledger start --background
-python -m focusledger status
+python -m focusledger init
+python -m focusledger autostart install
+python -m focusledger deliverable add "你的主要目标" --keywords 关键词
+```
+
+每天：
+
+```bash
+python -m focusledger workday start
 ```
 
 查看今天：
@@ -314,10 +468,18 @@ python -m focusledger summary --today
 python -m focusledger attention --today --timeline
 ```
 
-一天结束后可视化复盘：
+随时看实时仪表台：
 
 ```bash
 python -m focusledger report --today
+```
+
+下班：
+
+```bash
+python -m focusledger workday offwork
+python -m focusledger review write
+python -m focusledger review generate
 ```
 
 电脑重启后（agent 不会开机自启，需要手动再启动）：
