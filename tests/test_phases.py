@@ -190,6 +190,67 @@ class ClassifyTests(Fixture):
         self.assertEqual(result.matched_by, "deliverable")
         self.assertIsNotNone(result.deliverable_id)
 
+    def test_unknown_targets_use_the_real_app_name(self) -> None:
+        """Regression: timeline rows key the app as `process_name`.
+
+        Reading only `process` yielded "(unknown)" as the pattern, which made
+        both the fix-up command and the model prompt useless.
+        """
+        classified = [{
+            "process_name": "Figma", "window_title": "Untitled - design",
+            "category": UNKNOWN, "duration_seconds": 600, "site": None,
+        }]
+        targets = unknown_targets(classified)
+        self.assertEqual(targets[0]["pattern"], "figma")
+        self.assertEqual(targets[0]["sample_title"], "Untitled - design")
+
+    def test_llm_labels_are_validated_before_being_stored(self) -> None:
+        from focusledger.services.classify import (
+            add_rule, build_label_prompt, label_unknowns_with_llm, list_rules, parse_label_reply,
+        )
+
+        targets = [
+            {"scope": "process", "pattern": "figma", "seconds": 600, "sample_title": "design"},
+            {"scope": "site", "pattern": "example.io", "seconds": 200, "sample_title": "blog"},
+        ]
+        prompt = build_label_prompt(targets)
+        self.assertIn("figma", prompt)
+        self.assertIn("productive_core", prompt)
+
+        messy = (
+            "Sure, here you go:\n"
+            "figma => productive_core\n"
+            "example.io => learning_general\n"
+            "hallucinated => gaming\n"      # pattern was never asked about
+            "figma => social\n"             # duplicate, must not override
+            "example.io => banana\n"        # not a real category
+        )
+        labels = parse_label_reply(messy, targets)
+        self.assertEqual(
+            {(l["pattern"], l["category"]) for l in labels},
+            {("figma", "productive_core"), ("example.io", "learning_general")},
+        )
+
+        with mock.patch.object(llm_service, "generate", return_value=messy):
+            stored = label_unknowns_with_llm(self.conn, self.config, targets)
+        self.assertEqual(len(stored), 2)
+        patterns = {str(r["pattern"]) for r in list_rules(self.conn)}
+        self.assertEqual(patterns, {"figma", "example.io"})
+        self.assertNotIn("hallucinated", patterns)
+
+    def test_learned_rule_beats_builtin_but_loses_to_manual(self) -> None:
+        from focusledger.services.classify import add_rule
+
+        add_rule(self.conn, SCOPE_PROCESS, "steam", PRODUCTIVE_CORE, note="llm:test")
+        result = classify("Steam", "Steam", load_rule_context(self.conn))
+        self.assertEqual(result.category, PRODUCTIVE_CORE)
+        self.assertEqual(result.matched_by, "learned")
+
+        add_correction(self.conn, "dev", SCOPE_PROCESS, "steam", ENTERTAINMENT)
+        result = classify("Steam", "Steam", load_rule_context(self.conn))
+        self.assertEqual(result.category, ENTERTAINMENT)
+        self.assertEqual(result.matched_by, "manual")
+
     def test_unknown_targets_rank_by_time(self) -> None:
         classified = [
             {"process": "WeirdApp", "title": "x", "category": UNKNOWN, "duration_seconds": 300,

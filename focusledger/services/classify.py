@@ -61,6 +61,7 @@ DISTRACTING_CATEGORIES = (ENTERTAINMENT, GAMING, SOCIAL)
 
 MATCH_MANUAL = "manual"
 MATCH_DELIVERABLE = "deliverable"
+MATCH_LEARNED = "learned"
 MATCH_SITE = "site"
 MATCH_PROCESS = "process"
 MATCH_TITLE = "title"
@@ -86,6 +87,7 @@ class Classification:
         return {
             MATCH_MANUAL: 1.0,
             MATCH_DELIVERABLE: 0.9,
+            MATCH_LEARNED: 0.85,
             MATCH_SITE: 0.8,
             MATCH_PROCESS: 0.7,
             MATCH_TITLE: 0.6,
@@ -231,11 +233,51 @@ def remove_correction(conn: Connection, scope: str, pattern: str) -> bool:
     return cur.rowcount > 0
 
 
+def add_rule(conn: Connection, scope: str, pattern: str, category: str, note: str = "") -> None:
+    """Store a learned rule. Ranks below a manual correction, above the built-ins."""
+    if scope not in SCOPES:
+        raise ValueError(f"unsupported scope: {scope}")
+    if category not in CATEGORIES:
+        raise ValueError(f"unknown category: {category}")
+    now = datetime.now().astimezone().isoformat()
+    pattern = pattern.strip().lower()
+    conn.execute(
+        "DELETE FROM classification_rules WHERE match_type = ? AND pattern = ?", (scope, pattern)
+    )
+    conn.execute(
+        "INSERT INTO classification_rules(id, priority, match_type, pattern, category, note,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (uuid.uuid4().hex, 50, scope, pattern, category, note, now),
+    )
+    conn.commit()
+
+
+def list_rules(conn: Connection) -> list[dict[str, object]]:
+    return [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM classification_rules ORDER BY match_type, pattern"
+        ).fetchall()
+    ]
+
+
+def remove_rule(conn: Connection, scope: str, pattern: str) -> bool:
+    cur = conn.execute(
+        "DELETE FROM classification_rules WHERE match_type = ? AND pattern = ?",
+        (scope, pattern.strip().lower()),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def load_rule_context(conn: Connection) -> dict[str, object]:
     """Snapshot the stored rules once so a whole day can be classified cheaply."""
     corrections: dict[str, dict[str, str]] = {scope: {} for scope in SCOPES}
     for row in list_corrections(conn):
         corrections[str(row["scope"])][str(row["pattern"])] = str(row["category"])
+
+    learned: dict[str, dict[str, str]] = {scope: {} for scope in SCOPES}
+    for row in list_rules(conn):
+        learned[str(row["match_type"])][str(row["pattern"])] = str(row["category"])
 
     deliverables = [
         dict(r)
@@ -243,7 +285,7 @@ def load_rule_context(conn: Connection) -> dict[str, object]:
             "SELECT id, title, match_keywords FROM deliverables WHERE status != 'archived'"
         ).fetchall()
     ]
-    return {"corrections": corrections, "deliverables": deliverables}
+    return {"corrections": corrections, "learned": learned, "deliverables": deliverables}
 
 
 def _match_deliverable(context: dict[str, object], process_name: str | None, title: str | None):
@@ -268,8 +310,10 @@ def classify(
     context: dict[str, object] | None = None,
 ) -> Classification:
     """Resolve one activity segment to a category."""
-    context = context or {"corrections": {s: {} for s in SCOPES}, "deliverables": []}
+    context = context or {"corrections": {s: {} for s in SCOPES},
+                          "learned": {s: {} for s in SCOPES}, "deliverables": []}
     corrections: dict[str, dict[str, str]] = context.get("corrections", {})  # type: ignore[assignment]
+    learned: dict[str, dict[str, str]] = context.get("learned", {})  # type: ignore[assignment]
 
     browser = parse_browser_context(process_name, window_title)
     site = browser.site
@@ -294,7 +338,16 @@ def classify(
             deliverable_id=str(deliverable["id"]), site=site,
         )
 
-    # 3. site
+    # 3. rules learned for this machine (e.g. labelled by the local model)
+    if site and site in learned.get(SCOPE_SITE, {}):
+        return Classification(learned[SCOPE_SITE][site], MATCH_LEARNED, site, site=site)
+    if key and key in learned.get(SCOPE_PROCESS, {}):
+        return Classification(learned[SCOPE_PROCESS][key], MATCH_LEARNED, key, site=site)
+    for pattern, category in learned.get(SCOPE_TITLE, {}).items():
+        if pattern and pattern in lowered_title:
+            return Classification(category, MATCH_LEARNED, pattern, site=site)
+
+    # 4. site
     site_category = _match_site(site, effective_title)
     if site_category:
         return Classification(site_category, MATCH_SITE, site, site=site)
@@ -306,7 +359,7 @@ def classify(
         if not browser.is_browser:
             return Classification(process_category, MATCH_PROCESS, key, site=site)
 
-    # 5. title keyword
+    # 6. title keyword
     title_category = _match_title(effective_title)
     if title_category:
         return Classification(title_category, MATCH_TITLE, None, site=site)
@@ -391,12 +444,109 @@ def unknown_targets(classified: list[dict[str, object]]) -> list[dict[str, objec
         if segment["category"] != UNKNOWN:
             continue
         site = segment.get("site")
+        # Timeline rows carry `process_name`; classified copies carry `process`.
+        # Reading only one of them silently produced "(unknown)" as the pattern,
+        # which made both the fix-up command and the model prompt useless.
+        process = segment.get("process") or segment.get("process_name") or "(unknown)"
         scope, pattern = (SCOPE_SITE, str(site)) if site else (
-            SCOPE_PROCESS, str(segment.get("process") or "(unknown)").lower()
+            SCOPE_PROCESS, str(process).lower()
         )
         entry = buckets.setdefault(
             (scope, pattern),
-            {"scope": scope, "pattern": pattern, "seconds": 0.0, "sample_title": segment.get("title")},
+            {
+                "scope": scope, "pattern": pattern, "seconds": 0.0,
+                "sample_title": segment.get("title") or segment.get("window_title"),
+            },
         )
         entry["seconds"] = float(entry["seconds"]) + float(segment.get("duration_seconds") or 0.0)
     return sorted(buckets.values(), key=lambda e: float(e["seconds"]), reverse=True)
+
+
+# --------------------------------------------------------------------------
+# offline LLM fallback (spec Phase 5.5)
+# --------------------------------------------------------------------------
+_LLM_SYSTEM = (
+    "You label computer applications and websites by what a person uses them for. "
+    "You reply only with lines of the form `pattern => category`. "
+    "No prose, no explanation, no markdown."
+)
+
+# Only the meanings a human would actually pick from; idle/attention_gap are
+# attention states, not activities, so they are excluded from the choices.
+_LLM_CHOICES = (
+    PRODUCTIVE_CORE, LEARNING_GENERAL, NEUTRAL_EDUCATIONAL, ADMIN,
+    ENTERTAINMENT, GAMING, SOCIAL, COMMUNICATION,
+)
+
+
+def build_label_prompt(targets: list[dict[str, object]]) -> str:
+    """Ask for a category per unknown app/site, with sample titles as evidence."""
+    lines = ["Label each of these by what the person was most likely doing.", ""]
+    for entry in targets:
+        sample = str(entry.get("sample_title") or "").strip()[:80]
+        kind = "website" if entry["scope"] == SCOPE_SITE else "application"
+        lines.append(
+            f"- {entry['pattern']}  ({kind}"
+            + (f', example window title: "{sample}"' if sample else "")
+            + ")"
+        )
+    lines += [
+        "",
+        "Allowed categories, use exactly these strings:",
+        ", ".join(_LLM_CHOICES),
+        "",
+        "Reply with one line per item, nothing else:",
+        "pattern => category",
+    ]
+    return "\n".join(lines)
+
+
+def parse_label_reply(reply: str, targets: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Read the model's answer, keeping only lines that name a real target and category.
+
+    A small model will occasionally invent a category or a pattern; anything not
+    recognised is dropped rather than guessed at, so a bad reply degrades to
+    fewer labels instead of wrong ones.
+    """
+    by_pattern = {str(t["pattern"]).lower(): t for t in targets}
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for raw in reply.splitlines():
+        line = raw.strip().lstrip("-*• ").strip()
+        if "=>" not in line:
+            continue
+        pattern, _, category = line.partition("=>")
+        pattern = pattern.strip().strip("`\"'").lower()
+        category = category.strip().strip("`\"'.").lower()
+        target = by_pattern.get(pattern)
+        if target is None or category not in _LLM_CHOICES or pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append({
+            "scope": str(target["scope"]),
+            "pattern": pattern,
+            "category": category,
+            "seconds": float(target.get("seconds") or 0.0),
+        })
+    return out
+
+
+def label_unknowns_with_llm(conn: Connection, config, targets, apply: bool = True):
+    """Have the local model label unknown apps/sites, then store them as rules.
+
+    Runs offline on demand — never inside the collection loop, per the spec:
+    a model call there would add latency and let a model failure cost samples.
+    """
+    from focusledger.services import llm as llm_service
+
+    if not targets:
+        return []
+    reply = llm_service.generate(
+        config, _LLM_SYSTEM, build_label_prompt(targets), temperature=0.0, max_tokens=400
+    )
+    labels = parse_label_reply(reply, targets)
+    if apply:
+        model = getattr(config, "llm_model", "local")
+        for label in labels:
+            add_rule(conn, label["scope"], label["pattern"], label["category"], note=f"llm:{model}")
+    return labels
