@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from sqlite3 import Connection
 
+from focusledger.timeutil import align, parse_aligned
+
 NOT_STARTED = "not_started"
 ACTIVE = "active"
 PAUSED = "paused"
@@ -277,9 +279,9 @@ def describe(conn: Connection, config, workday_key: str, now: datetime | None = 
         return None
     moment = now or _now()
 
-    started = datetime.fromisoformat(str(session["started_at"]))
+    started = align(datetime.fromisoformat(str(session["started_at"])), moment)
     ended_raw = session["ended_at"]
-    ended = datetime.fromisoformat(str(ended_raw)) if ended_raw else moment
+    ended = align(datetime.fromisoformat(str(ended_raw)), moment) if ended_raw else moment
 
     # A day left running forever is a data bug, not a 30-hour shift.
     cap = started + timedelta(hours=config.max_workday_hours)
@@ -289,8 +291,11 @@ def describe(conn: Connection, config, workday_key: str, now: datetime | None = 
     pauses = list_pauses(conn, str(session["id"]))
     paused_seconds = 0.0
     for pause in pauses:
-        p_start = datetime.fromisoformat(str(pause["started_at"]))
-        p_end = datetime.fromisoformat(str(pause["ended_at"])) if pause["ended_at"] else ended
+        p_start = align(datetime.fromisoformat(str(pause["started_at"])), ended)
+        p_end = (
+            align(datetime.fromisoformat(str(pause["ended_at"])), ended)
+            if pause["ended_at"] else ended
+        )
         paused_seconds += max(0.0, (min(p_end, ended) - p_start).total_seconds())
 
     elapsed = max(0.0, (ended - started).total_seconds())
@@ -327,10 +332,10 @@ def missing_data_intervals(
 
     beats = []
     for row in rows:
-        try:
-            beats.append(datetime.fromisoformat(str(row["timestamp"])))
-        except ValueError:
-            continue
+        beat = parse_aligned(row["timestamp"], start)
+        if beat is not None:
+            beats.append(beat)
+    beats.sort()
 
     intervals: list[dict[str, object]] = []
     cursor = start

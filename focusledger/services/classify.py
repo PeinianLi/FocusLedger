@@ -23,6 +23,7 @@ from datetime import datetime
 from sqlite3 import Connection
 
 from focusledger.services.browser import parse_browser_context
+from focusledger.timeutil import overlap_seconds, parse_moment
 
 PRODUCTIVE_CORE = "productive_core"
 LEARNING_GENERAL = "learning_general"
@@ -289,14 +290,12 @@ def load_rule_context(conn: Connection) -> dict[str, object]:
 
 
 def _match_deliverable(context: dict[str, object], process_name: str | None, title: str | None):
+    from focusledger.services.deliverables import keyword_matches, usable_keywords
+
     haystack = f"{process_name or ''} {title or ''}".lower()
     for deliverable in context.get("deliverables", []):  # type: ignore[union-attr]
-        keywords = str(deliverable.get("match_keywords") or "")
-        terms = [t.strip().lower() for t in keywords.split(",") if t.strip()]
-        if not terms:
-            terms = [str(deliverable["title"]).strip().lower()]
-        for term in terms:
-            if term and term in haystack:
+        for term in usable_keywords(deliverable):
+            if keyword_matches(term, haystack):
                 return deliverable, term
     return None, None
 
@@ -401,18 +400,16 @@ def attach_attention_weight(
     """
     spans = []
     for segment in attention_segments:
-        try:
-            start = datetime.fromisoformat(str(segment["started_at"]))
-            end = datetime.fromisoformat(str(segment["ended_at"]))
-        except (ValueError, KeyError, TypeError):
+        start = parse_moment(segment.get("started_at"))
+        end = parse_moment(segment.get("ended_at"))
+        if start is None or end is None:
             continue
         spans.append((start, end, float(segment.get("attention_weight") or 0.0)))
 
     for segment in classified:
-        try:
-            start = datetime.fromisoformat(str(segment["started_at"]))
-            end = datetime.fromisoformat(str(segment["ended_at"]))
-        except (ValueError, KeyError, TypeError):
+        start = parse_moment(segment.get("started_at"))
+        end = parse_moment(segment.get("ended_at"))
+        if start is None or end is None:
             segment["attention_weight"] = 1.0
             continue
         total = (end - start).total_seconds()
@@ -421,10 +418,10 @@ def attach_attention_weight(
             continue
         weighted = 0.0
         for span_start, span_end, weight in spans:
-            overlap_seconds = (min(end, span_end) - max(start, span_start)).total_seconds()
-            if overlap_seconds > 0:
-                weighted += overlap_seconds * weight
-        segment["attention_weight"] = weighted / total
+            shared = overlap_seconds(start, end, span_start, span_end)
+            if shared > 0:
+                weighted += shared * weight
+        segment["attention_weight"] = min(1.0, weighted / total)
     return classified
 
 

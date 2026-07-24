@@ -12,6 +12,7 @@ the note is collected before a review is written.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from sqlite3 import Connection
@@ -29,6 +30,37 @@ PRIORITY_LABELS = {1: "high", 2: "normal", 3: "low"}
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat()
+
+
+MIN_KEYWORD_LENGTH = 3
+
+
+def keyword_matches(term: str, haystack: str) -> bool:
+    """Whether a deliverable keyword really occurs in a window title.
+
+    Plain substring matching is far too eager: the keyword "a" matches
+    "engineering chat", which would attribute an entire day to the wrong
+    deliverable. Latin keywords therefore have to land on a word boundary, and
+    very short ones are ignored outright. CJK has no word boundaries and is
+    matched as a substring, where the false-positive risk is much lower.
+    """
+    term = (term or "").strip().lower()
+    if not term:
+        return False
+    haystack = (haystack or "").lower()
+    if term.isascii():
+        if len(term) < MIN_KEYWORD_LENGTH:
+            return False
+        return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", haystack) is not None
+    return term in haystack
+
+
+def usable_keywords(deliverable: dict[str, object]) -> list[str]:
+    raw = str(deliverable.get("match_keywords") or "")
+    terms = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not terms:
+        terms = [str(deliverable.get("title", "")).strip().lower()]
+    return [t for t in terms if t and (not t.isascii() or len(t) >= MIN_KEYWORD_LENGTH)]
 
 
 # --------------------------------------------------------------------------
@@ -214,13 +246,9 @@ def attribute_time(
         for d in deliverables
     }
 
-    keyword_index: list[tuple[str, list[str]]] = []
-    for deliverable in deliverables:
-        raw = str(deliverable.get("match_keywords") or "")
-        terms = [t.strip().lower() for t in raw.split(",") if t.strip()]
-        if not terms:
-            terms = [str(deliverable["title"]).strip().lower()]
-        keyword_index.append((str(deliverable["id"]), terms))
+    keyword_index = [
+        (str(deliverable["id"]), usable_keywords(deliverable)) for deliverable in deliverables
+    ]
 
     for segment in classified_segments:
         duration = float(segment.get("duration_seconds") or 0.0)
@@ -230,7 +258,7 @@ def attribute_time(
         if not target:
             haystack = f"{segment.get('process', '')} {segment.get('title', '')}".lower()
             for deliverable_id, terms in keyword_index:
-                if any(term and term in haystack for term in terms):
+                if any(keyword_matches(term, haystack) for term in terms):
                     target = deliverable_id
                     break
         if not target or target not in totals:

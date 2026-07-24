@@ -46,6 +46,7 @@ from focusledger.services.deliverables import (
     stalled_deliverables,
 )
 from focusledger.services import workday as workday_service
+from focusledger.timeutil import align, parse_moment
 
 LLM_OK = "ok"
 LLM_FAILED = "failed"
@@ -55,16 +56,80 @@ LLM_SKIPPED = "skipped"
 # --------------------------------------------------------------------------
 # digest
 # --------------------------------------------------------------------------
+def _covered_days(conn: Connection, config, workday_key: str) -> list:
+    """Every calendar day the workday touches.
+
+    A session that starts at 22:00 and ends at 01:30 belongs to one workday but
+    spans two calendar dates. Reading only the key's date silently dropped all
+    the work done after midnight — the exact case the workday model exists for.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    first = _date.fromisoformat(workday_key)
+    session = workday_service.get_session(conn, workday_key)
+    if not session:
+        return [first]
+    started = parse_moment(session["started_at"]) or datetime.now().astimezone()
+    ended = parse_moment(session["ended_at"]) or datetime.now().astimezone()
+    last = max(ended.date(), started.date(), first)
+    # Guard against a session left open for weeks producing a huge scan.
+    span_days = min((last - first).days, 2)
+    return [first + _td(days=offset) for offset in range(span_days + 1)]
+
+
+def _within_session(rows: list[dict[str, object]], session, key: str) -> list[dict[str, object]]:
+    """Drop rows outside the session window when there is one."""
+    if not session:
+        return rows
+    started = parse_moment(session["started_at"])
+    ended = parse_moment(session["ended_at"]) or datetime.now().astimezone()
+    if started is None:
+        return rows
+    kept = []
+    for row in rows:
+        moment = parse_moment(row.get("started_at"))
+        if moment is None:
+            continue
+        moment = align(moment, started)
+        if started <= moment <= align(ended, started):
+            kept.append(row)
+    return kept
+
+
+def _totals_from_segments(segments: list[dict[str, object]]) -> dict[str, float]:
+    """Recompute attention totals from segments.
+
+    summarize_attention is scoped to one calendar day, so a workday crossing
+    midnight has to be totalled from its own segments instead.
+    """
+    totals: dict[str, float] = {"raw_seconds": 0.0, "effective_seconds": 0.0}
+    for segment in segments:
+        duration = float(segment.get("duration_seconds") or 0.0)
+        weight = float(segment.get("attention_weight") or 0.0)
+        state = str(segment.get("attention_state") or "unknown")
+        totals["raw_seconds"] += duration
+        totals["effective_seconds"] += duration * weight
+        totals[f"{state}_seconds"] = totals.get(f"{state}_seconds", 0.0) + duration
+    return totals
+
+
 def build_digest(conn: Connection, config, workday_key: str) -> dict[str, object]:
     """Collect everything a review needs, with all arithmetic already done."""
-    from datetime import date as _date
-
-    day = _date.fromisoformat(workday_key)
     policy = AttentionPolicy.from_config(config)
+    session = workday_service.get_session(conn, workday_key)
+    days = _covered_days(conn, config, workday_key)
 
-    attention = summarize_attention(conn, day, config.poll_interval_seconds, policy)
-    attention_segments = list_attention_segments(conn, day, policy)
-    activity = list_timeline(conn, day)
+    attention_segments, activity = [], []
+    for day in days:
+        attention_segments.extend(list_attention_segments(conn, day, policy))
+        activity.extend(list_timeline(conn, day))
+    attention_segments = _within_session(attention_segments, session, workday_key)
+    activity = _within_session(activity, session, workday_key)
+
+    if len(days) > 1 or session:
+        attention = _totals_from_segments(attention_segments)
+    else:
+        attention = summarize_attention(conn, days[0], config.poll_interval_seconds, policy)
 
     rules = load_rule_context(conn)
     classified = classify_segments(activity, rules)

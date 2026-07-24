@@ -504,3 +504,90 @@ class AutostartTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+class RegressionTests(Fixture):
+    """Bugs found by probing edge cases; each of these once shipped broken."""
+
+    def test_review_covers_a_workday_that_crosses_midnight(self) -> None:
+        """The digest used to read only the key's calendar date.
+
+        A 22:00-01:30 session lost every sample after midnight — the exact case
+        the workday model exists to handle.
+        """
+        start = datetime(2026, 5, 6, 22, 0).astimezone()
+        for i in range(210):
+            self.sample(start + timedelta(minutes=i), "PyCharm", "main.py")
+        self.conn.commit()
+        wd.start_workday(self.conn, self.config, at=start)
+        wd.end_workday(self.conn, at=start + timedelta(minutes=210))
+
+        key = wd.workday_key_for(start, self.config)
+        self.assertEqual(key, "2026-05-06")
+        digest = review_service.build_digest(self.conn, self.config, key)
+        self.assertGreater(digest["attention"]["raw_seconds"], 3.3 * 3600)
+
+    def test_missing_data_survives_a_naive_timestamp(self) -> None:
+        """A naive row used to raise TypeError against the aware boundaries."""
+        import uuid
+
+        self.conn.execute(
+            "INSERT INTO agent_heartbeats(id, device_id, timestamp, pid, status, message)"
+            " VALUES (?, ?, ?, ?, ?, NULL)",
+            (uuid.uuid4().hex, "dev", "2026-05-06T09:00:00", 1, "running"),
+        )
+        self.conn.commit()
+        intervals = wd.missing_data_intervals(
+            self.conn, self.config,
+            datetime(2026, 5, 6, 8, 0).astimezone(),
+            datetime(2026, 5, 6, 12, 0).astimezone(),
+        )
+        self.assertIsInstance(intervals, list)
+
+    def test_attention_weighting_survives_mixed_awareness(self) -> None:
+        base = datetime(2026, 5, 6, 9, 0)
+        classified = [{
+            "started_at": base.isoformat(),
+            "ended_at": (base + timedelta(minutes=10)).isoformat(),
+            "duration_seconds": 600,
+        }]
+        attention = [{
+            "started_at": base.astimezone().isoformat(),
+            "ended_at": (base + timedelta(minutes=10)).astimezone().isoformat(),
+            "attention_weight": 0.5,
+        }]
+        attach_attention_weight(classified, attention)
+        self.assertAlmostEqual(classified[0]["attention_weight"], 0.5, places=2)
+
+    def test_short_keyword_cannot_swallow_unrelated_activity(self) -> None:
+        """`a` used to match "engineering chat" and claim the whole day."""
+        from focusledger.services.deliverables import keyword_matches
+
+        self.assertFalse(keyword_matches("a", "engineering chat"))
+        self.assertFalse(keyword_matches("app", "happy chatting"))
+        self.assertFalse(keyword_matches("api", "rapid prototyping"))
+        self.assertTrue(keyword_matches("api", "API design doc"))
+        self.assertTrue(keyword_matches("focusledger", "report.py - FocusLedger"))
+        self.assertTrue(keyword_matches("报告", "季度报告初稿"))
+
+    def test_one_letter_keyword_does_not_link_a_deliverable(self) -> None:
+        dl.add_deliverable(self.conn, "A", keywords="a")
+        result = classify("Slack", "engineering chat", load_rule_context(self.conn))
+        self.assertNotEqual(result.matched_by, "deliverable")
+
+    def test_attention_weight_never_exceeds_one(self) -> None:
+        """Overlapping attention spans could sum past 1.0 and inflate effort."""
+        base = datetime(2026, 5, 6, 9, 0).astimezone()
+        classified = [{
+            "started_at": base.isoformat(),
+            "ended_at": (base + timedelta(minutes=10)).isoformat(),
+            "duration_seconds": 600,
+        }]
+        span = {
+            "started_at": base.isoformat(),
+            "ended_at": (base + timedelta(minutes=10)).isoformat(),
+            "attention_weight": 1.0,
+        }
+        attach_attention_weight(classified, [span, dict(span)])
+        self.assertLessEqual(classified[0]["attention_weight"], 1.0)
