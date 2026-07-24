@@ -389,6 +389,32 @@ class LlmTests(unittest.TestCase):
         self.assertFalse(status.available)
         self.assertIn("cannot reach", status.detail)
 
+    def test_loopback_requests_bypass_a_configured_proxy(self) -> None:
+        """Regression: a campus/corporate proxy must not intercept 127.0.0.1.
+
+        urllib honours http_proxy for every request, so without an explicit
+        bypass a local model endpoint is handed to the proxy, which answers
+        403 and makes a perfectly healthy local model look unreachable.
+        """
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {
+            "http_proxy": "http://proxy.invalid:3128",
+            "HTTP_PROXY": "http://proxy.invalid:3128",
+            "all_proxy": "http://proxy.invalid:3128",
+        }):
+            status = llm_service.probe(self.config, timeout=2.0)
+        # It must fail by connecting directly (refused), never via the proxy.
+        self.assertFalse(status.available)
+        self.assertNotIn("forbidden", status.detail.lower())
+        self.assertNotIn("proxy", status.detail.lower())
+
+    def test_loopback_detection(self) -> None:
+        for url in ["http://127.0.0.1:11434", "http://localhost:11434", "http://127.5.0.1:1"]:
+            self.assertTrue(llm_service.is_loopback(url), url)
+        self.assertFalse(llm_service.is_loopback("http://ollama.example.com:11434"))
+
     def test_model_name_matching_tolerates_the_latest_tag(self) -> None:
         self.assertTrue(llm_service._same_model("qwen2.5:latest", "qwen2.5"))
         self.assertTrue(llm_service._same_model("qwen2.5:1.5b", "qwen2.5:1.5b"))

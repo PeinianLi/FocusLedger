@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -114,13 +115,41 @@ def generate(config, system: str, user: str, timeout: float | None = None,
     return text
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def is_loopback(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return host in LOOPBACK_HOSTS or host.startswith("127.")
+
+
+def _opener(url: str):
+    """Build an opener that never proxies a request to the local machine.
+
+    urllib honours ``http_proxy`` for every request, so on a machine behind a
+    corporate or campus proxy even ``http://127.0.0.1:11434`` gets handed to
+    the proxy, which refuses it with a 403. A model running on this machine
+    must always be reached directly.
+    """
+    if is_loopback(url):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
+
+def _describe(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", exc)
+    return str(reason) or exc.__class__.__name__
+
+
 def _http_get(url: str, timeout: float) -> str:
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _opener(url).open(request, timeout=timeout) as response:
             return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise LlmUnavailable(f"{url} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise LlmUnavailable(f"cannot reach {url}: {getattr(exc, 'reason', exc)}") from exc
+        raise LlmUnavailable(f"cannot reach {url}: {_describe(exc)}") from exc
     except OSError as exc:
         raise LlmUnavailable(f"cannot reach {url}: {exc}") from exc
 
@@ -131,12 +160,12 @@ def _http_post(url: str, payload: dict, timeout: float) -> str:
         url, data=data, method="POST", headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _opener(url).open(request, timeout=timeout) as response:
             return response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
+        detail = exc.read().decode("utf-8", "replace").strip()[:200]
         raise LlmUnavailable(f"model endpoint returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise LlmUnavailable(f"cannot reach {url}: {getattr(exc, 'reason', exc)}") from exc
+        raise LlmUnavailable(f"cannot reach {url}: {_describe(exc)}") from exc
     except OSError as exc:
         raise LlmUnavailable(f"cannot reach {url}: {exc}") from exc
