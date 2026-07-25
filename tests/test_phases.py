@@ -576,6 +576,27 @@ class RegressionTests(Fixture):
         result = classify("Slack", "engineering chat", load_rule_context(self.conn))
         self.assertNotEqual(result.matched_by, "deliverable")
 
+    def test_productive_share_cannot_exceed_100_percent(self) -> None:
+        """The fallback compared raw foreground time to weighted attention.
+
+        A window left open while idle inflated raw productive time above the
+        effective total, so the review read "(159%)". The comparison now uses
+        the weighted productive figure and is clamped.
+        """
+        digest = {
+            "productive_seconds": 15 * 3600,          # raw foreground, idle included
+            "distracting_seconds": 0,
+            "productive_effective_seconds": 8 * 3600,  # weighted
+            "distracting_effective_seconds": 0,
+            "attention": {"effective_seconds": 9.5 * 3600},
+            "attribution": [], "stalled": [], "open_tasks": [],
+            "distraction_reasons": {}, "note": None,
+        }
+        prose = review_service._fallback_prose(digest)
+        import re
+        pct = int(re.search(r"\((\d+)%\)", prose).group(1))
+        self.assertLessEqual(pct, 100)
+
     def test_attention_weight_never_exceeds_one(self) -> None:
         """Overlapping attention spans could sum past 1.0 and inflate effort."""
         base = datetime(2026, 5, 6, 9, 0).astimezone()

@@ -145,6 +145,21 @@ def build_digest(conn: Connection, config, workday_key: str) -> dict[str, object
     productive = sum(categories.get(c, 0.0) for c in PRODUCTIVE_CATEGORIES)
     distracting = sum(categories.get(c, 0.0) for c in DISTRACTING_CATEGORIES)
 
+    # Effective (attention-weighted) versions. The raw category totals count a
+    # window's whole foreground time, idle included, so comparing raw productive
+    # time to effective attention could exceed 100%. The prose uses these.
+    def _effective_for(wanted: tuple[str, ...]) -> float:
+        total = 0.0
+        for segment in classified:
+            if str(segment.get("category")) in wanted:
+                total += float(segment.get("duration_seconds") or 0.0) * float(
+                    segment.get("attention_weight") or 0.0
+                )
+        return total
+
+    productive_effective = _effective_for(PRODUCTIVE_CATEGORIES)
+    distracting_effective = _effective_for(DISTRACTING_CATEGORIES)
+
     return {
         "workday_key": workday_key,
         "workday": view,
@@ -153,6 +168,8 @@ def build_digest(conn: Connection, config, workday_key: str) -> dict[str, object
         "classified": classified,
         "productive_seconds": productive,
         "distracting_seconds": distracting,
+        "productive_effective_seconds": productive_effective,
+        "distracting_effective_seconds": distracting_effective,
         "attribution": attribution,
         "stalled": stalled,
         "open_tasks": list_tasks(conn, include_done=False),
@@ -305,8 +322,11 @@ def _briefing(digest: dict[str, object], language: str) -> str:
     lines = [
         f"Date: {digest['workday_key']}",
         f"Effective attention: {_fmt(digest['attention'].get('effective_seconds', 0))}",  # type: ignore[union-attr]
-        f"Core productive + learning: {_fmt(digest['productive_seconds'])}",
-        f"Entertainment/gaming/social: {_fmt(digest['distracting_seconds'])}",
+        f"Core productive + learning (foreground): {_fmt(digest['productive_seconds'])}",
+        f"Core productive + learning (effective): "
+        f"{_fmt(digest.get('productive_effective_seconds', digest['productive_seconds']))}",
+        f"Entertainment/gaming/social (effective): "
+        f"{_fmt(digest.get('distracting_effective_seconds', digest['distracting_seconds']))}",
     ]
     categories = sorted(
         digest["categories"].items(), key=lambda kv: kv[1], reverse=True  # type: ignore[union-attr]
@@ -398,14 +418,14 @@ def _ensure_sections(text: str) -> str:
 def _fallback_prose(digest: dict[str, object]) -> str:
     """Deterministic retrospective used whenever no model answered."""
     lines = ["## Review\n"]
-    productive = float(digest["productive_seconds"])
-    distracting = float(digest["distracting_seconds"])
+    productive = float(digest.get("productive_effective_seconds", digest["productive_seconds"]))
+    distracting = float(digest.get("distracting_effective_seconds", digest["distracting_seconds"]))
     effective = float(digest["attention"].get("effective_seconds", 0.0))  # type: ignore[union-attr]
 
     if effective <= 0:
         lines.append("- No effective attention was recorded for this day.")
     else:
-        share = productive / effective * 100 if effective else 0
+        share = min(100, productive / effective * 100)
         lines.append(
             f"- {_fmt(productive)} of {_fmt(effective)} effective attention "
             f"({share:.0f}%) went to core productive or learning work."
