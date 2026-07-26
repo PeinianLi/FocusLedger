@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime, timezone, tzinfo
 from dataclasses import dataclass
 
 from focusledger.agent.heartbeat import write_heartbeat
@@ -13,6 +13,7 @@ from focusledger.services.activity import record_activity_snapshot
 from focusledger.services.alerts import DistractionTracker, notify, record_distraction
 from focusledger.services.attention import AttentionPolicy
 from focusledger.services.classify import classify, load_rule_context
+from focusledger.services.retention import apply_retention
 from focusledger.services.workday import ACTIVE as WORKDAY_ACTIVE
 from focusledger.services.workday import OVERTIME as WORKDAY_OVERTIME
 from focusledger.services.workday import current_session
@@ -20,6 +21,7 @@ from focusledger.services.settings import get_setting, set_setting
 
 
 LOGGER = logging.getLogger(__name__)
+RETENTION_RETRY_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -43,11 +45,44 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
     with connect(config.database_path) as conn:
         set_setting(conn, "agent_stop_requested", "false")
         write_heartbeat(conn, device_id=config.device_id, message="agent started")
+        last_retention_date: date | None = None
+        next_retention_attempt = 0.0
 
         while True:
             if get_setting(conn, "agent_stop_requested", "false") == "true":
                 write_heartbeat(conn, device_id=config.device_id, status="stopped", message="stop requested")
                 break
+
+            current_local_date = _system_local_date()
+            monotonic_now = time.monotonic()
+            if (
+                current_local_date != last_retention_date
+                and monotonic_now >= next_retention_attempt
+            ):
+                try:
+                    result = apply_retention(
+                        conn,
+                        retention_days=config.raw_retention_days,
+                        poll_interval_seconds=config.poll_interval_seconds,
+                        attention_policy=attention_policy,
+                    )
+                    LOGGER.info(
+                        "retention complete archived_days=%s raw_deleted=%s "
+                        "heartbeats_deleted=%s activity_segments=%s "
+                        "attention_segments=%s",
+                        result.archived_days,
+                        result.raw_events_deleted,
+                        result.heartbeats_deleted,
+                        result.activity_segments_written,
+                        result.attention_segments_written,
+                    )
+                    last_retention_date = current_local_date
+                    next_retention_attempt = 0.0
+                except Exception:
+                    LOGGER.exception("retention failed; retrying in five minutes")
+                    next_retention_attempt = (
+                        monotonic_now + RETENTION_RETRY_SECONDS
+                    )
 
             try:
                 snapshot = adapter.get_active_window()
@@ -72,6 +107,18 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
                 break
 
             time.sleep(config.poll_interval_seconds)
+
+
+def _system_local_date(
+    now: datetime | None = None,
+    local_timezone: tzinfo | None = None,
+) -> date:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    if local_timezone is None:
+        return current.astimezone().date()
+    return current.astimezone(local_timezone).date()
 
 
 def _check_distraction(conn, config: AppConfig, tracker: DistractionTracker, snapshot) -> None:

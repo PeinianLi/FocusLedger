@@ -1,7 +1,7 @@
 # Devlog: macOS Collection Parity and Interactive HTML Report
 
-Updated: 2026-07-18 04:45  
-Author: Lichen Zhu  
+Updated: 2026-07-18
+Author: Lichen Zhu
 Baseline commit: `4c7f687 Reorganize docs and add CLI usage guide`
 
 ## Summary

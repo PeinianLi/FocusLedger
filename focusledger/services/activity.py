@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlite3 import Connection
 
 from focusledger.models import ActiveWindowSnapshot
@@ -13,6 +13,7 @@ from focusledger.services.attention import (
     classify_attention,
 )
 from focusledger.services.privacy import sanitize_snapshot
+from focusledger.time_context import capture_time_context
 
 
 DEFAULT_SEGMENT_GAP_SECONDS = 15
@@ -28,20 +29,29 @@ def record_activity_snapshot(
     attention_policy: AttentionPolicy | None = None,
 ) -> None:
     snapshot = sanitize_snapshot(snapshot)
-    captured_at = snapshot.captured_at.isoformat()
+    time_context = capture_time_context(snapshot.captured_at)
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO raw_activity_events(
-            id, device_id, captured_at, process_id, process_name, executable_path,
+            id, device_id, captured_at, captured_at_utc, local_date,
+            timezone_id, timezone_name, utc_offset_seconds, is_dst,
+            local_day_start_utc, process_id, process_name, executable_path,
             window_title, window_handle, source, idle_seconds, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             uuid.uuid4().hex,
             device_id,
-            captured_at,
+            time_context.captured_at,
+            time_context.captured_at_utc,
+            time_context.local_date,
+            time_context.timezone_id,
+            time_context.timezone_name,
+            time_context.utc_offset_seconds,
+            int(time_context.is_dst),
+            time_context.local_day_start_utc,
             snapshot.process_id,
             snapshot.process_name,
             snapshot.executable_path,
@@ -71,7 +81,10 @@ def _upsert_application(conn: Connection, snapshot: ActiveWindowSnapshot, now: s
 
 
 def list_timeline(conn: Connection, day: date) -> list[dict[str, object]]:
-    return _derive_activity_segments(_list_raw_activity_events(conn, day))
+    raw_rows = _list_raw_activity_events(conn, day)
+    if raw_rows:
+        return _derive_activity_segments(raw_rows)
+    return _list_archived_activity_segments(conn, day)
 
 
 def summarize_by_app(conn: Connection, day: date) -> list[dict[str, object]]:
@@ -101,10 +114,13 @@ def list_attention_segments(
     day: date,
     attention_policy: AttentionPolicy | None = None,
 ) -> list[dict[str, object]]:
-    return _derive_attention_segments(
-        _list_raw_activity_events(conn, day),
-        attention_policy or AttentionPolicy(),
-    )
+    raw_rows = _list_raw_activity_events(conn, day)
+    if raw_rows:
+        return _derive_attention_segments(
+            raw_rows,
+            attention_policy or AttentionPolicy(),
+        )
+    return _list_archived_attention_segments(conn, day)
 
 
 def summarize_attention(
@@ -121,7 +137,10 @@ def summarize_attention(
     effective_seconds = 0.0
 
     raw_rows = _list_raw_activity_events(conn, day)
-    attention_segments = _derive_attention_segments(raw_rows, policy)
+    if raw_rows:
+        attention_segments = _derive_attention_segments(raw_rows, policy)
+    else:
+        attention_segments = _list_archived_attention_segments(conn, day)
     for segment in attention_segments:
         state = str(segment["attention_state"])
         seconds = float(segment["duration_seconds"] or 0.0)
@@ -129,35 +148,39 @@ def summarize_attention(
         totals[state] += seconds
         effective_seconds += seconds * state_weight
 
-    weight = float(poll_interval_seconds)
-    # Per-app attention is a sample-level approximation because app ownership is
-    # stored on raw events, while attention intervals can span multiple apps.
-    rows = raw_rows
-    for row in rows:
-        name = row["process_name"] or "(unknown)"
-        result = classify_attention(row["idle_seconds"], policy)
-        state = result.state
-        state_weight = result.weight
+    if raw_rows:
+        weight = float(poll_interval_seconds)
+        # Raw dates keep sample-level application ownership.
+        for row in raw_rows:
+            name = row["process_name"] or "(unknown)"
+            result = classify_attention(row["idle_seconds"], policy)
+            state = result.state
+            state_weight = result.weight
 
-        bucket = per_app.setdefault(
-            name,
+            bucket = per_app.setdefault(
+                name,
+                {
+                    **{state_name: 0.0 for state_name in all_states},
+                    "raw_seconds": 0.0,
+                    "effective_seconds": 0.0,
+                },
+            )
+            bucket[state] += weight
+            bucket["raw_seconds"] += weight
+            bucket["effective_seconds"] += weight * state_weight
+
+        per_app_rows = [
             {
-                **{state_name: 0.0 for state_name in all_states},
-                "raw_seconds": 0.0,
-                "effective_seconds": 0.0,
-            },
+                "process_name": name,
+                **values,
+            }
+            for name, values in per_app.items()
+        ]
+    else:
+        per_app_rows = _summarize_archived_attention_by_app(
+            _list_archived_activity_segments(conn, day),
+            attention_segments,
         )
-        bucket[state] += weight
-        bucket["raw_seconds"] += weight
-        bucket["effective_seconds"] += weight * state_weight
-
-    per_app_rows = [
-        {
-            "process_name": name,
-            **values,
-        }
-        for name, values in per_app.items()
-    ]
     per_app_rows.sort(
         key=lambda row: row["raw_seconds"],
         reverse=True,
@@ -172,25 +195,170 @@ def summarize_attention(
 
 
 def _list_raw_activity_events(conn: Connection, day: date) -> list[dict[str, object]]:
-    start = datetime.combine(day, time.min).astimezone()
-    end = datetime.combine(day, time.max).astimezone()
     rows = conn.execute(
         """
         SELECT
             device_id,
             captured_at,
+            captured_at_utc,
+            local_date,
+            timezone_id,
+            timezone_name,
+            utc_offset_seconds,
+            is_dst,
+            local_day_start_utc,
             process_name,
             executable_path,
             window_title,
             source,
             idle_seconds
         FROM raw_activity_events
-        WHERE captured_at >= ? AND captured_at <= ?
-        ORDER BY captured_at ASC
+        WHERE local_date = ?
+           OR (local_date IS NULL AND substr(captured_at, 1, 10) = ?)
+        ORDER BY COALESCE(captured_at_utc, captured_at) ASC
         """,
-        (start.isoformat(), end.isoformat()),
+        (day.isoformat(), day.isoformat()),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _list_archived_activity_segments(
+    conn: Connection,
+    day: date,
+) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT
+            device_id,
+            started_at,
+            ended_at,
+            started_at_utc,
+            ended_at_utc,
+            timezone_id,
+            timezone_name,
+            utc_offset_seconds,
+            is_dst,
+            local_day_start_utc,
+            duration_seconds,
+            process_name,
+            executable_path,
+            window_title,
+            source
+        FROM activity_segments
+        WHERE local_date = ?
+        ORDER BY COALESCE(started_at_utc, started_at) ASC
+        """,
+        (day.isoformat(),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _list_archived_attention_segments(
+    conn: Connection,
+    day: date,
+) -> list[dict[str, object]]:
+    rows = conn.execute(
+        """
+        SELECT
+            device_id,
+            started_at,
+            ended_at,
+            started_at_utc,
+            ended_at_utc,
+            timezone_id,
+            timezone_name,
+            utc_offset_seconds,
+            is_dst,
+            local_day_start_utc,
+            duration_seconds,
+            attention_state,
+            attention_weight,
+            max_idle_seconds,
+            source
+        FROM attention_segments
+        WHERE local_date = ?
+        ORDER BY COALESCE(started_at_utc, started_at) ASC
+        """,
+        (day.isoformat(),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _summarize_archived_attention_by_app(
+    activity_segments: list[dict[str, object]],
+    attention_segments: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Calculate per-app attention from the two cooked segment streams."""
+    all_states = (*ATTENTION_STATES, UNKNOWN)
+    activity_by_device: dict[str, list[dict[str, object]]] = {}
+    for segment in activity_segments:
+        device_id = str(segment.get("device_id") or "")
+        activity_by_device.setdefault(device_id, []).append(segment)
+    for segments in activity_by_device.values():
+        segments.sort(key=lambda row: _segment_utc(row, "started"))
+
+    output: dict[str, dict[str, object]] = {}
+    search_from: dict[str, int] = {}
+    for attention in attention_segments:
+        device_id = str(attention.get("device_id") or "")
+        activities = activity_by_device.get(device_id, [])
+        if not activities:
+            continue
+
+        attention_start = _segment_utc(attention, "started")
+        attention_end = _segment_utc(attention, "ended")
+        if attention_end <= attention_start:
+            continue
+
+        index = search_from.get(device_id, 0)
+        while (
+            index < len(activities)
+            and _segment_utc(activities[index], "ended") <= attention_start
+        ):
+            index += 1
+        search_from[device_id] = index
+
+        state = str(attention.get("attention_state") or UNKNOWN)
+        if state not in all_states:
+            state = UNKNOWN
+        weight = float(attention.get("attention_weight") or 0.0)
+
+        for activity in activities[index:]:
+            activity_start = _segment_utc(activity, "started")
+            if activity_start >= attention_end:
+                break
+            activity_end = _segment_utc(activity, "ended")
+            overlap_start = max(attention_start, activity_start)
+            overlap_end = min(attention_end, activity_end)
+            seconds = max(0.0, (overlap_end - overlap_start).total_seconds())
+            if seconds <= 0:
+                continue
+
+            process_name = str(activity.get("process_name") or "(unknown)")
+            bucket = output.setdefault(
+                process_name,
+                {
+                    "process_name": process_name,
+                    **{state_name: 0.0 for state_name in all_states},
+                    "raw_seconds": 0.0,
+                    "effective_seconds": 0.0,
+                },
+            )
+            bucket[state] = float(bucket[state]) + seconds
+            bucket["raw_seconds"] = float(bucket["raw_seconds"]) + seconds
+            bucket["effective_seconds"] = (
+                float(bucket["effective_seconds"]) + seconds * weight
+            )
+
+    return list(output.values())
+
+
+def _segment_utc(row: dict[str, object], prefix: str) -> datetime:
+    value = row.get(f"{prefix}_at_utc") or row[f"{prefix}_at"]
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _derive_activity_segments(
@@ -199,40 +367,46 @@ def _derive_activity_segments(
 ) -> list[dict[str, object]]:
     segments: list[dict[str, object]] = []
     current: dict[str, object] | None = None
-    previous_at: datetime | None = None
+    previous_at_utc: datetime | None = None
 
     for row in rows:
         captured_at = datetime.fromisoformat(str(row["captured_at"]))
+        captured_at_utc = _row_utc(row)
         key = _activity_key(row)
         if current is None:
-            current = _new_activity_segment(row, captured_at)
-            previous_at = captured_at
+            current = _new_activity_segment(row, captured_at, captured_at_utc)
+            previous_at_utc = captured_at_utc
             continue
 
-        assert previous_at is not None
-        gap_seconds = max(0.0, (captured_at - previous_at).total_seconds())
+        assert previous_at_utc is not None
+        gap_seconds = max(
+            0.0,
+            (captured_at_utc - previous_at_utc).total_seconds(),
+        )
         current_key = _activity_key(current)
         if key == current_key and gap_seconds <= segment_gap_seconds:
             current["ended_at"] = captured_at.isoformat()
+            current["ended_at_utc"] = captured_at_utc.isoformat()
             current["duration_seconds"] = max(
                 0.0,
                 (
-                    captured_at
-                    - datetime.fromisoformat(str(current["started_at"]))
+                    captured_at_utc
+                    - datetime.fromisoformat(str(current["started_at_utc"]))
                 ).total_seconds(),
             )
         else:
             segments.append(current)
-            current = _new_activity_segment(row, captured_at)
-        previous_at = captured_at
+            current = _new_activity_segment(row, captured_at, captured_at_utc)
+        previous_at_utc = captured_at_utc
 
     if current is not None:
         segments.append(current)
     return segments
 
 
-def _activity_key(row: dict[str, object]) -> tuple[object, object, object, object]:
+def _activity_key(row: dict[str, object]) -> tuple[object, ...]:
     return (
+        row.get("device_id"),
         row["process_name"] or "(unknown)",
         row["window_title"] or "",
         row["executable_path"],
@@ -243,10 +417,20 @@ def _activity_key(row: dict[str, object]) -> tuple[object, object, object, objec
 def _new_activity_segment(
     row: dict[str, object],
     captured_at: datetime,
+    captured_at_utc: datetime,
 ) -> dict[str, object]:
     return {
+        "device_id": row.get("device_id"),
         "started_at": captured_at.isoformat(),
         "ended_at": captured_at.isoformat(),
+        "started_at_utc": captured_at_utc.isoformat(),
+        "ended_at_utc": captured_at_utc.isoformat(),
+        "local_date": row.get("local_date"),
+        "timezone_id": row.get("timezone_id"),
+        "timezone_name": row.get("timezone_name"),
+        "utc_offset_seconds": row.get("utc_offset_seconds"),
+        "is_dst": row.get("is_dst"),
+        "local_day_start_utc": row.get("local_day_start_utc"),
         "duration_seconds": 0.0,
         "process_name": row["process_name"] or "(unknown)",
         "window_title": row["window_title"] or "",
@@ -311,7 +495,53 @@ def _derive_attention_segments(
             policy,
             segment_gap_seconds,
         )
+    _attach_attention_time_context(output, rows)
     return output
+
+
+def _attach_attention_time_context(
+    segments: list[dict[str, object]],
+    rows: list[dict[str, object]],
+) -> None:
+    if not segments or not rows:
+        return
+    row_times = [_row_utc(row) for row in rows]
+    row_index = 0
+    for segment in segments:
+        started_at = datetime.fromisoformat(str(segment["started_at"]))
+        ended_at = datetime.fromisoformat(str(segment["ended_at"]))
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        if ended_at.tzinfo is None:
+            ended_at = ended_at.replace(tzinfo=timezone.utc)
+        started_at_utc = started_at.astimezone(timezone.utc)
+        ended_at_utc = ended_at.astimezone(timezone.utc)
+        while (
+            row_index < len(rows) - 1
+            and row_times[row_index] < started_at_utc
+        ):
+            row_index += 1
+        context = rows[row_index]
+        segment["device_id"] = context.get("device_id")
+        segment["started_at_utc"] = started_at_utc.isoformat()
+        segment["ended_at_utc"] = ended_at_utc.isoformat()
+        segment["local_date"] = context.get("local_date")
+        segment["timezone_id"] = context.get("timezone_id")
+        segment["timezone_name"] = context.get("timezone_name")
+        segment["utc_offset_seconds"] = context.get("utc_offset_seconds")
+        segment["is_dst"] = context.get("is_dst")
+        segment["local_day_start_utc"] = context.get("local_day_start_utc")
+
+
+def _row_utc(row: dict[str, object]) -> datetime:
+    value = row.get("captured_at_utc")
+    if value:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    else:
+        parsed = datetime.fromisoformat(str(row["captured_at"]))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _append_finalized_idle_interval(

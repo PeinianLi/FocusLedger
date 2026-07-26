@@ -98,7 +98,7 @@ class BuildReportDataTests(unittest.TestCase):
             data = build_report_data(conn, base.date(), poll_interval_seconds=5)
             seg = data["activity"]["segments"][0]
             self.assertAlmostEqual(seg["start_min"], 9 * 60 + 30, places=3)
-            self.assertEqual(seg["start_label"], "09:30:00")
+            self.assertEqual(seg["start_label"], "09:30:00 UTC")
             conn.close()
 
     def test_empty_day_produces_valid_empty_report(self) -> None:

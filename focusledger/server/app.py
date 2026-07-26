@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import closing
 from datetime import date, datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,7 +91,7 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
             return
 
         config = self.server.config  # type: ignore[attr-defined]
-        with connect(config.database_path) as conn:
+        with closing(connect(config.database_path)) as conn:
             payload = build_report_data(
                 conn,
                 day,
@@ -104,7 +105,7 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_status(self) -> None:
         config = self.server.config  # type: ignore[attr-defined]
-        with connect(config.database_path) as conn:
+        with closing(connect(config.database_path)) as conn:
             self._send_json(HTTPStatus.OK, _agent_status(conn, config))
 
     def _serve_static(self, relative: str) -> None:
@@ -120,8 +121,10 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         # The UI is regenerated per request; never let a browser cache it.
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
 
     def _send_json(self, status: HTTPStatus, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -129,8 +132,10 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
 
     def log_message(self, fmt: str, *args) -> None:
         """Silence per-request logging; the CLI prints its own summary."""

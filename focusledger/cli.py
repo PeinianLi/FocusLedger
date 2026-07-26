@@ -31,6 +31,7 @@ from focusledger.services.activity import (
 from focusledger.services.attention import AttentionPolicy
 from focusledger.services.dev import reset_database
 from focusledger.services.privacy import redact_existing_private_browser_titles
+from focusledger.services.retention import apply_retention
 from focusledger.cli_support import ensure_initialized as _ensure_initialized
 from focusledger.server.app import create_server, serve_forever
 from focusledger.services.report import build_report_data, render_report_html
@@ -66,6 +67,21 @@ def build_parser() -> argparse.ArgumentParser:
     db_subparsers = db_parser.add_subparsers(required=True)
     db_path_parser = db_subparsers.add_parser("path", help="Print database path.")
     db_path_parser.set_defaults(func=cmd_db_path)
+    db_prune_parser = db_subparsers.add_parser(
+        "prune",
+        help="Archive expired raw samples now.",
+    )
+    db_prune_parser.set_defaults(func=cmd_db_prune)
+    db_compact_parser = db_subparsers.add_parser(
+        "compact",
+        help="Rebuild the SQLite file and enable incremental auto-vacuum.",
+    )
+    db_compact_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the database rebuild.",
+    )
+    db_compact_parser.set_defaults(func=cmd_db_compact)
 
     config_parser = subparsers.add_parser("config", help="Config helpers.")
     config_subparsers = config_parser.add_subparsers(required=True)
@@ -76,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show attention thresholds and weights.",
     )
     config_attention_parser.set_defaults(func=cmd_config_attention)
+    config_retention_parser = config_subparsers.add_parser(
+        "retention",
+        help="Show raw-data retention policy.",
+    )
+    config_retention_parser.set_defaults(func=cmd_config_retention)
     config_set_parser = config_subparsers.add_parser("set", help="Update config values.")
     config_set_subparsers = config_set_parser.add_subparsers(required=True)
     poll_interval_parser = config_set_subparsers.add_parser(
@@ -84,6 +105,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     poll_interval_parser.add_argument("seconds", type=int)
     poll_interval_parser.set_defaults(func=cmd_config_set_poll_interval)
+    raw_retention_parser = config_set_subparsers.add_parser(
+        "raw-retention-days",
+        help="Set the number of local calendar dates kept as raw data.",
+    )
+    raw_retention_parser.add_argument("days", type=int)
+    raw_retention_parser.set_defaults(func=cmd_config_set_raw_retention_days)
     attention_thresholds_parser = config_set_subparsers.add_parser(
         "attention-thresholds",
         help="Set low/gap/interrupted/hard-idle thresholds in minutes.",
@@ -242,6 +269,55 @@ def cmd_db_path(args: argparse.Namespace) -> None:
     print(cfg.database_path)
 
 
+def cmd_db_prune(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    policy = AttentionPolicy.from_config(cfg)
+    with connect(cfg.database_path) as conn:
+        result = apply_retention(
+            conn,
+            retention_days=cfg.raw_retention_days,
+            poll_interval_seconds=cfg.poll_interval_seconds,
+            attention_policy=policy,
+        )
+    print("Retention completed.")
+    print(f"  archived_days: {result.archived_days}")
+    print(f"  raw_events_deleted: {result.raw_events_deleted}")
+    print(f"  heartbeats_deleted: {result.heartbeats_deleted}")
+    print(f"  activity_segments_written: {result.activity_segments_written}")
+    print(f"  attention_segments_written: {result.attention_segments_written}")
+
+
+def cmd_db_compact(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    if not args.yes:
+        print("This rebuilds the SQLite database to release unused disk space.")
+        print("Stop the agent first, then run again with --yes.")
+        print(f"Database: {cfg.database_path}")
+        return
+
+    with connect(cfg.database_path) as conn:
+        heartbeat = latest_heartbeat(conn)
+        if heartbeat and heartbeat["status"] == "running":
+            age_seconds = heartbeat_age_seconds(str(heartbeat["timestamp"]))
+            stale_after = max(cfg.poll_interval_seconds * 3, 30)
+            if age_seconds <= stale_after:
+                raise SystemExit(
+                    "agent is still running; stop it before compacting the database"
+                )
+        before_bytes = (
+            cfg.database_path.stat().st_size
+            if cfg.database_path.exists()
+            else 0
+        )
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        conn.execute("VACUUM")
+    after_bytes = cfg.database_path.stat().st_size
+    print("Database compacted.")
+    print(f"  before_bytes: {before_bytes}")
+    print(f"  after_bytes: {after_bytes}")
+    print(f"  released_bytes: {max(0, before_bytes - after_bytes)}")
+
+
 def cmd_config_path(args: argparse.Namespace) -> None:
     cfg = ensure_config()
     print(config_path(cfg.data_dir))
@@ -254,6 +330,25 @@ def cmd_config_set_poll_interval(args: argparse.Namespace) -> None:
     updated = replace(cfg, poll_interval_seconds=args.seconds)
     save_config(updated)
     print(f"poll_interval_seconds set to {args.seconds}")
+
+
+def cmd_config_set_raw_retention_days(args: argparse.Namespace) -> None:
+    if args.days < 1:
+        raise SystemExit("raw retention days must be at least 1")
+    cfg = ensure_config()
+    updated = replace(cfg, raw_retention_days=args.days)
+    save_config(updated)
+    print(f"raw_retention_days set to {args.days}")
+
+
+def cmd_config_retention(args: argparse.Namespace) -> None:
+    cfg = ensure_config()
+    local_now = datetime.now().astimezone()
+    timezone_label = local_now.tzname() or str(local_now.utcoffset())
+    print("Raw-data retention")
+    print(f"  days: {cfg.raw_retention_days}")
+    print(f"  timezone: system ({timezone_label})")
+    print("  schedule: nightly at system-local midnight; catch up on agent start")
 
 
 def cmd_config_attention(args: argparse.Namespace) -> None:
@@ -320,8 +415,12 @@ def cmd_timeline(args: argparse.Namespace) -> None:
         print(f"No activity segments for {day}.")
         return
     for row in rows:
-        start = datetime.fromisoformat(str(row["started_at"])).strftime("%H:%M:%S")
-        end = datetime.fromisoformat(str(row["ended_at"])).strftime("%H:%M:%S")
+        start = datetime.fromisoformat(str(row["started_at"])).strftime(
+            "%H:%M:%S %z"
+        )
+        end = datetime.fromisoformat(str(row["ended_at"])).strftime(
+            "%H:%M:%S %z"
+        )
         duration = format_duration(row["duration_seconds"])
         process = row["process_name"] or "(unknown)"
         title = row["window_title"] or ""
@@ -391,8 +490,12 @@ def cmd_attention(args: argparse.Namespace) -> None:
         print()
         print("Attention segments")
         for row in segments:
-            start = datetime.fromisoformat(str(row["started_at"])).strftime("%H:%M:%S")
-            end = datetime.fromisoformat(str(row["ended_at"])).strftime("%H:%M:%S")
+            start = datetime.fromisoformat(str(row["started_at"])).strftime(
+                "%H:%M:%S %z"
+            )
+            end = datetime.fromisoformat(str(row["ended_at"])).strftime(
+                "%H:%M:%S %z"
+            )
             duration = format_duration(row["duration_seconds"])
             state = row["attention_state"]
             state_weight = row["attention_weight"]

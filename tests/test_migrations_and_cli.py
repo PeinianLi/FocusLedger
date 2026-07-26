@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from focusledger.agent.runner import _system_local_date
 from focusledger.cli import build_parser, heartbeat_age_seconds, render_attention_timeline
 from focusledger.config import build_default_config, load_config
 from focusledger.db.connection import connect
@@ -16,7 +17,7 @@ from focusledger.db.migrations import SCHEMA_VERSION, apply_migrations
 
 
 class MigrationAndCliTests(unittest.TestCase):
-    def test_v1_database_adds_idle_seconds_column(self) -> None:
+    def test_v1_database_adds_current_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "focusledger.sqlite3"
             conn = sqlite3.connect(db_path)
@@ -57,10 +58,135 @@ class MigrationAndCliTests(unittest.TestCase):
             conn.close()
 
             self.assertIn("idle_seconds", columns)
+            self.assertIn("captured_at_utc", columns)
+            self.assertIn("local_date", columns)
+            self.assertIn("timezone_id", columns)
+            self.assertIn("utc_offset_seconds", columns)
+            self.assertIn("is_dst", columns)
             self.assertNotIn("attention_state", columns)
             self.assertNotIn("attention_weight", columns)
-            self.assertIsNone(attention_table)
+            self.assertIsNotNone(attention_table)
             self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_v5_phase_tables_and_v7_cooked_tables_coexist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            conn.close()
+
+            self.assertIn("activity_segments", tables)
+            self.assertIn("attention_segments", tables)
+            self.assertIn("workday_sessions", tables)
+            self.assertIn("classification_rules", tables)
+            self.assertIn("deliverables", tables)
+            self.assertIn("daily_reviews", tables)
+
+    def test_v6_daily_attention_table_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "focusledger.sqlite3"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE daily_app_attention (
+                    local_date TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    process_name TEXT NOT NULL,
+                    raw_seconds REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO daily_app_attention
+                VALUES ('2026-07-01', 'device', 'Code.exe', 60)
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            conn = connect(db_path)
+            apply_migrations(conn)
+            table = conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name = 'daily_app_attention'
+                """
+            ).fetchone()
+            version = conn.execute(
+                "SELECT value FROM app_metadata WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            conn.close()
+
+            self.assertIsNone(table)
+            self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_legacy_derived_tables_receive_local_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "focusledger.sqlite3"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE activity_segments (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    process_name TEXT,
+                    window_title TEXT,
+                    executable_path TEXT,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE attention_segments (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    attention_state TEXT NOT NULL,
+                    attention_weight REAL NOT NULL,
+                    max_idle_seconds REAL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO activity_segments
+                VALUES (
+                    'activity', 'device', '2026-07-01T09:00:00+00:00',
+                    '2026-07-01T09:01:00+00:00', 60, 'Code.exe', 'Title',
+                    'Code.exe', 'legacy', 'now', 'now'
+                );
+                INSERT INTO attention_segments
+                VALUES (
+                    'attention', 'device', '2026-07-01T09:00:00+00:00',
+                    '2026-07-01T09:01:00+00:00', 60, 'active', 1, 0,
+                    'legacy', 'now', 'now'
+                );
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            conn = connect(db_path)
+            apply_migrations(conn)
+            activity_date = conn.execute(
+                "SELECT local_date FROM activity_segments"
+            ).fetchone()["local_date"]
+            attention_date = conn.execute(
+                "SELECT local_date FROM attention_segments"
+            ).fetchone()["local_date"]
+            conn.close()
+
+            self.assertEqual(activity_date, "2026-07-01")
+            self.assertEqual(attention_date, "2026-07-01")
 
     def test_start_parser_accepts_background(self) -> None:
         args = build_parser().parse_args(["start", "--background"])
@@ -85,6 +211,7 @@ class MigrationAndCliTests(unittest.TestCase):
                 "attention_gap_weight",
                 "attention_interrupted_weight",
                 "attention_hard_idle_weight",
+                "raw_retention_days",
             ):
                 raw.pop(key)
             (data_dir / "config.json").write_text(
@@ -104,6 +231,21 @@ class MigrationAndCliTests(unittest.TestCase):
             self.assertEqual(config.interrupted_after_seconds, 1200)
             self.assertEqual(config.hard_idle_after_seconds, 1800)
             self.assertEqual(config.attention_low_activity_weight, 0.5)
+            self.assertEqual(config.raw_retention_days, 7)
+
+    def test_parser_accepts_raw_retention_days(self) -> None:
+        args = build_parser().parse_args(
+            ["config", "set", "raw-retention-days", "14"]
+        )
+        self.assertEqual(args.days, 14)
+
+    def test_retention_date_uses_system_local_timezone(self) -> None:
+        now = datetime(2026, 7, 25, 2, 0, tzinfo=timezone.utc)
+        local_date = _system_local_date(
+            now,
+            timezone(timedelta(hours=-4)),
+        )
+        self.assertEqual(local_date.isoformat(), "2026-07-24")
 
     def test_render_attention_timeline_compacts_segments(self) -> None:
         base = datetime(2026, 7, 10, 9, 0, tzinfo=timezone.utc)

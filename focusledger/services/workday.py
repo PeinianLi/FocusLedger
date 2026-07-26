@@ -18,6 +18,7 @@ from datetime import date, datetime, time, timedelta
 from sqlite3 import Connection
 
 from focusledger.timeutil import align, parse_aligned
+from focusledger.time_context import capture_time_context
 
 NOT_STARTED = "not_started"
 ACTIVE = "active"
@@ -153,7 +154,12 @@ def start_workday(conn: Connection, config, at: datetime | None = None) -> dict[
         VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?)
         """,
         (
-            session_id, config.device_id, key, now_iso, config.timezone, ACTIVE,
+            session_id,
+            config.device_id,
+            key,
+            now_iso,
+            capture_time_context(moment).timezone_id,
+            ACTIVE,
             config.default_offwork_time, REVIEW_PENDING, now_iso, now_iso,
         ),
     )
@@ -239,8 +245,16 @@ def mark_day(conn: Connection, config, workday_key: str, status: str) -> dict[st
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
             """,
             (
-                uuid.uuid4().hex, config.device_id, workday_key, now_iso, now_iso,
-                config.timezone, status, REVIEW_DONE, now_iso, now_iso,
+                uuid.uuid4().hex,
+                config.device_id,
+                workday_key,
+                now_iso,
+                now_iso,
+                capture_time_context(_now()).timezone_id,
+                status,
+                REVIEW_DONE,
+                now_iso,
+                now_iso,
             ),
         )
     conn.commit()
@@ -330,20 +344,49 @@ def missing_data_intervals(
         (start.isoformat(), end.isoformat()),
     ).fetchall()
 
-    beats = []
+    coverage: list[tuple[datetime, datetime]] = []
     for row in rows:
         beat = parse_aligned(row["timestamp"], start)
         if beat is not None:
-            beats.append(beat)
-    beats.sort()
+            coverage.append((beat, beat))
+
+    # Retention removes old heartbeats after preserving the same coverage in
+    # cooked activity segments. Include their endpoints so historical reviews
+    # do not mistake intentionally archived data for an agent outage.
+    cooked_rows = conn.execute(
+        """
+        SELECT started_at_utc, ended_at_utc, started_at, ended_at
+        FROM activity_segments
+        WHERE local_date >= ? AND local_date <= ?
+        """,
+        (
+            (start - timedelta(days=1)).date().isoformat(),
+            (end + timedelta(days=1)).date().isoformat(),
+        ),
+    ).fetchall()
+    for row in cooked_rows:
+        segment_start = parse_aligned(
+            row["started_at_utc"] or row["started_at"], start
+        )
+        segment_end = parse_aligned(
+            row["ended_at_utc"] or row["ended_at"], start
+        )
+        if segment_start is None or segment_end is None:
+            continue
+        if segment_end < start or segment_start > end:
+            continue
+        coverage.append(
+            (max(start, segment_start), min(end, segment_end))
+        )
+    coverage.sort(key=lambda interval: interval[0])
 
     intervals: list[dict[str, object]] = []
     cursor = start
-    for beat in beats:
-        gap = (beat - cursor).total_seconds()
+    for covered_start, covered_end in coverage:
+        gap = (covered_start - cursor).total_seconds()
         if gap > tolerance:
-            intervals.append(_interval(cursor, beat))
-        cursor = max(cursor, beat)
+            intervals.append(_interval(cursor, covered_start))
+        cursor = max(cursor, covered_start, covered_end)
     trailing = (end - cursor).total_seconds()
     if trailing > tolerance:
         intervals.append(_interval(cursor, end))

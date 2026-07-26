@@ -1,7 +1,7 @@
 # Devlog: Completing the MVP — Phases 3 through 9
 
-Updated: 2026-07-24 16:00  
-Author: Lichen Zhu  
+Updated: 2026-07-24
+Author: Lichen Zhu
 Baseline commit: `c5f91ef Add report command: interactive single-file HTML attention dashboard`
 
 ## Summary

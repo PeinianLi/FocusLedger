@@ -1,7 +1,7 @@
 # Devlog: Attention Timeline, Background Agent, and Derived Data Model
 
-Updated: 2026-07-10 06:32  
-Author: PeinianLi  
+Updated: 2026-07-10
+Author: Peinian Li
 Baseline commit: `68889fe Add macOS collection (dependency-free), privacy/dev services, idle tracking + attention summary`
 
 ## Summary

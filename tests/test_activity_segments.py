@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
@@ -43,6 +44,34 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 
 class ActivitySegmentTests(unittest.TestCase):
+    def test_dst_fallback_uses_utc_order_without_splitting_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            eastern = ZoneInfo("America/New_York")
+            before_fallback = datetime(
+                2026, 11, 1, 1, 59, 59, tzinfo=eastern, fold=0
+            )
+            after_fallback = datetime(
+                2026, 11, 1, 1, 0, 0, tzinfo=eastern, fold=1
+            )
+
+            for captured_at in (before_fallback, after_fallback):
+                record_activity_snapshot(
+                    conn,
+                    device_id="device_test",
+                    snapshot=make_snapshot(
+                        captured_at, "Code.exe", "DST-safe timeline"
+                    ),
+                    segment_gap_seconds=15,
+                )
+
+            rows = list_timeline(conn, before_fallback.date())
+            conn.close()
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["duration_seconds"], 1)
+            self.assertLess(rows[0]["started_at_utc"], rows[0]["ended_at_utc"])
+
     def test_same_window_samples_merge_into_one_segment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conn = open_db(Path(tmp) / "focusledger.sqlite3")
@@ -71,7 +100,9 @@ class ActivitySegmentTests(unittest.TestCase):
                 WHERE type = 'table' AND name = 'activity_segments'
                 """
             ).fetchone()
-            self.assertIsNone(stored_segments)
+            self.assertIsNotNone(stored_segments)
+            stored_count = conn.execute("SELECT COUNT(*) FROM activity_segments").fetchone()[0]
+            self.assertEqual(stored_count, 0)
             conn.close()
 
     def test_changed_title_creates_new_segment(self) -> None:
@@ -433,23 +464,6 @@ class ActivitySegmentTests(unittest.TestCase):
                     base.isoformat(),
                     base.isoformat(),
                 ),
-            )
-            conn.execute(
-                """
-                CREATE TABLE activity_segments (
-                    id TEXT PRIMARY KEY,
-                    device_id TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    duration_seconds REAL NOT NULL DEFAULT 0,
-                    process_name TEXT,
-                    window_title TEXT,
-                    executable_path TEXT,
-                    source TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
             )
             conn.execute(
                 """

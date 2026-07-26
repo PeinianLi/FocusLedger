@@ -26,6 +26,13 @@ CREATE TABLE IF NOT EXISTS raw_activity_events (
     id TEXT PRIMARY KEY,
     device_id TEXT NOT NULL,
     captured_at TEXT NOT NULL,
+    captured_at_utc TEXT,
+    local_date TEXT,
+    timezone_id TEXT,
+    timezone_name TEXT,
+    utc_offset_seconds INTEGER,
+    is_dst INTEGER,
+    local_day_start_utc TEXT,
     process_id INTEGER,
     process_name TEXT,
     executable_path TEXT,
@@ -38,6 +45,50 @@ CREATE TABLE IF NOT EXISTS raw_activity_events (
 
 CREATE INDEX IF NOT EXISTS idx_raw_activity_events_captured_at
 ON raw_activity_events(captured_at);
+
+CREATE TABLE IF NOT EXISTS activity_segments (
+    id TEXT PRIMARY KEY,
+    local_date TEXT,
+    device_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    started_at_utc TEXT,
+    ended_at_utc TEXT,
+    timezone_id TEXT,
+    timezone_name TEXT,
+    utc_offset_seconds INTEGER,
+    is_dst INTEGER,
+    local_day_start_utc TEXT,
+    duration_seconds REAL NOT NULL,
+    process_name TEXT,
+    window_title TEXT,
+    executable_path TEXT,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attention_segments (
+    id TEXT PRIMARY KEY,
+    local_date TEXT,
+    device_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    started_at_utc TEXT,
+    ended_at_utc TEXT,
+    timezone_id TEXT,
+    timezone_name TEXT,
+    utc_offset_seconds INTEGER,
+    is_dst INTEGER,
+    local_day_start_utc TEXT,
+    duration_seconds REAL NOT NULL,
+    attention_state TEXT NOT NULL,
+    attention_weight REAL NOT NULL,
+    max_idle_seconds REAL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS applications (
     id TEXT PRIMARY KEY,

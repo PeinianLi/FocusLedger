@@ -1,6 +1,6 @@
 # FocusLedger
 
-FocusLedger 是一个本地优先的个人生产力审计工具。当前版本完成了提案 Phase 0-9 的 MVP：本地采集、attention 估算、workday 模型、活动分类、deliverable 追踪、分心提醒、本地 LLM 日报、开机自启，以及一个实时的浏览器仪表台。所有数据只存在本机 SQLite，不上传任何服务器。
+FocusLedger 是一个本地优先的个人生产力审计工具。当前版本完成了提案 Phase 0-9 的 MVP：本地采集、attention 估算、workday 模型、活动分类、deliverable 追踪、分心提醒、本地 LLM 日报、开机自启，以及一个实时的浏览器仪表台。合并后的 schema v8 使用 raw/cooked 两层存储，在保留长期时间线的同时控制数据库增长。所有数据只存在本机 SQLite，不上传任何服务器。
 
 ## 文档入口
 
@@ -16,23 +16,45 @@ README 只保留项目级说明；具体命令、日常操作和排查步骤统�
 ```text
 启动 agent
 -> 采集当前前台窗口和键盘/鼠标 idle 秒数
--> 写入 SQLite 原始事件
--> 查询时推导 activity timeline / attention / 分类 / deliverable 归因 / missing data
+-> 写入 SQLite raw events 与 agent heartbeats
+-> 最近日期从 raw data 推导 activity timeline / attention
+-> 每个系统本地日期变化后，将超出保留期的完整日期归档为 cooked data
+-> 历史日期直接读取 cooked activity / attention segments
+-> 查询时继续推导分类 / deliverable 归因 / missing data
 -> 分心达阈值时本地提醒并记录，等你标注原因
 -> 下班后收集手写进展，本地小模型生成日报和明日计划
 -> report 命令起本地服务，浏览器实时查看可交互仪表台
 ```
 
-**只有事实和你的输入会落库**：原始采样、workday 会话、deliverable/task、手动分类修正、
-分心原因、日报。以下内容一律在查询时推导，不作为派生数据长期写入：
+## Schema v8 与数据保留
+
+数据库按用途分为三组：
+
+- **raw data**：`raw_activity_events` 和 `agent_heartbeats`。默认保留最近 7 个系统本地日期，保留天数可配置。
+- **cooked data**：`activity_segments` 和 `attention_segments`。raw data 到期前按完整日期归档，长期保存。
+- **用户事实与功能状态**：workday session/pause、classification rule/correction、deliverable/task/note、distraction、daily review 等 Phase 3-9 表。
+
+以下内容仍在查询时计算，不额外保存副本：
 
 ```text
-activity segments        attention_state / attention_weight
-attention segments       活动分类（category）
+活动分类（category）      per-app / daily attention 汇总
 missing data intervals   deliverable 时间归因
 ```
 
-因此改一条分类规则或 attention 阈值时，历史数据会按新规则重新解释，而不会留下过期的旧结论。
+最近 raw data 可以按新的 attention 阈值重新解释；已经归档的 cooked data 保留归档当时生成的时间段。活动分类、per-app 汇总和 deliverable 归因仍会按当前规则从 raw 或 cooked data 计算。
+
+每条新采样同时保存本地时间、UTC、系统时区 ID、时区显示名、UTC offset、DST 状态和本地午夜对应的 UTC。排序和持续时间使用 UTC，避免切换时区或夏令时回拨造成时间线逆序、截断。
+
+常用维护命令：
+
+```bash
+python -m focusledger config retention
+python -m focusledger config set raw-retention-days 14
+python -m focusledger db prune
+python -m focusledger db compact --yes
+```
+
+`db compact --yes` 会重建 SQLite 文件，应先停止 agent。
 
 ## 平台支持状态
 
@@ -99,7 +121,7 @@ python -m focusledger llm status
 
 ## 可视化报告
 
-`focusledger report` 会在本机启动一个只监听 `127.0.0.1` 的报告服务并打开浏览器（`http://127.0.0.1:<port>/`）。页面是实时的：每次请求都从原始采样重新推导，agent 采到新数据后网页自动更新，且保留当前缩放位置。
+`focusledger report` 会在本机启动一个只监听 `127.0.0.1` 的报告服务并打开浏览器（`http://127.0.0.1:<port>/`）。页面是实时的：最近日期从 raw data 推导，历史日期读取 cooked data；agent 采到新数据后网页自动更新，且保留当前缩放位置。
 
 前端是 React 18，通过 vendored UMD 构建 + htm 模板直接运行，**不需要 Node、npm 或任何构建步骤**。`--export` 可以把同一套界面连同数据内联成一个离线单文件 HTML 快照。主要内容：
 
@@ -109,7 +131,7 @@ python -m focusledger llm status
 - **深度工作 sessions**：自动检测 ≥25 分钟的持续投入段，点击可缩放跳转。
 - **交互**：滚轮缩放（可深入到 2 分钟视窗）、快捷档位、拖拽平移、shift+框选、minimap 导航、十字准线 + 悬停详情；下方统计面板随可见范围实时聚合。
 
-报告与其他查询命令一样在请求时从原始采样推导，不落库。具体用法见 CLI 操作手册。
+报告与其他查询命令一样只读取现有 raw/cooked data，不为报告本身额外写入派生结果。具体用法见 CLI 操作手册。
 
 ## 隐私行为
 

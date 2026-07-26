@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -120,6 +120,37 @@ class WorkdayTests(Fixture):
         )
         self.assertEqual(len(intervals), 1)
         self.assertAlmostEqual(float(intervals[0]["duration_seconds"]), 30 * 60, delta=90)
+
+    def test_archived_activity_counts_as_historical_coverage(self) -> None:
+        base = datetime.now().astimezone().replace(hour=9, minute=0, second=0, microsecond=0)
+        ended = base + timedelta(minutes=50)
+        self.conn.execute(
+            """
+            INSERT INTO activity_segments(
+                id, device_id, started_at, ended_at, duration_seconds,
+                process_name, source, created_at, updated_at, local_date,
+                started_at_utc, ended_at_utc
+            )
+            VALUES (
+                'archived-coverage', 'dev', ?, ?, 3000,
+                'Code', 'retention', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                base.isoformat(),
+                ended.isoformat(),
+                base.isoformat(),
+                ended.isoformat(),
+                base.date().isoformat(),
+                base.astimezone(timezone.utc).isoformat(),
+                ended.astimezone(timezone.utc).isoformat(),
+            ),
+        )
+        self.conn.commit()
+
+        intervals = wd.missing_data_intervals(self.conn, self.config, base, ended)
+
+        self.assertEqual(intervals, [])
 
     def test_holiday_never_asks_for_a_review(self) -> None:
         wd.mark_day(self.conn, self.config, "2026-05-06", wd.HOLIDAY)

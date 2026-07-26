@@ -5,7 +5,6 @@ import os
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 
 APP_DIR_NAME = "FocusLedger"
@@ -19,6 +18,7 @@ class AppConfig:
     log_path: Path
     log_level: str
     poll_interval_seconds: int
+    raw_retention_days: int
     idle_threshold_seconds: int
     low_activity_after_seconds: int
     attention_gap_after_seconds: int
@@ -32,7 +32,6 @@ class AppConfig:
     platform: str
     device_id: str
     language: str
-    timezone: str
     # Phase 3: workday boundaries
     default_start_time: str
     default_offwork_time: str
@@ -72,10 +71,6 @@ def config_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / CONFIG_FILE_NAME
 
 
-def detect_timezone() -> str:
-    return os.environ.get("TZ") or "America/New_York"
-
-
 def build_default_config(data_dir: Path | None = None) -> AppConfig:
     root = data_dir or default_data_dir()
     return AppConfig(
@@ -83,7 +78,8 @@ def build_default_config(data_dir: Path | None = None) -> AppConfig:
         database_path=root / "focusledger.sqlite3",
         log_path=root / "focusledger.log",
         log_level="INFO",
-        poll_interval_seconds=5,
+        poll_interval_seconds=1,
+        raw_retention_days=7,
         idle_threshold_seconds=300,
         low_activity_after_seconds=180,
         attention_gap_after_seconds=600,
@@ -97,7 +93,6 @@ def build_default_config(data_dir: Path | None = None) -> AppConfig:
         platform=os.name,
         device_id=f"device_{uuid.uuid4().hex[:12]}",
         language="zh",
-        timezone=detect_timezone(),
         default_start_time="09:00",
         default_offwork_time="18:00",
         max_workday_hours=16.0,
@@ -137,6 +132,7 @@ def load_config() -> AppConfig:
         log_path=Path(str(merged["log_path"])),
         log_level=str(merged["log_level"]),
         poll_interval_seconds=int(merged["poll_interval_seconds"]),
+        raw_retention_days=int(merged["raw_retention_days"]),
         idle_threshold_seconds=int(merged["idle_threshold_seconds"]),
         low_activity_after_seconds=int(merged["low_activity_after_seconds"]),
         attention_gap_after_seconds=int(merged["attention_gap_after_seconds"]),
@@ -150,7 +146,6 @@ def load_config() -> AppConfig:
         platform=str(merged["platform"]),
         device_id=str(merged["device_id"]),
         language=str(merged["language"]),
-        timezone=str(merged["timezone"]),
         default_start_time=str(merged["default_start_time"]),
         default_offwork_time=str(merged["default_offwork_time"]),
         max_workday_hours=float(merged["max_workday_hours"]),
@@ -171,10 +166,3 @@ def save_config(config: AppConfig) -> None:
         json.dumps(config.to_json_dict(), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
-
-def get_timezone(config: AppConfig) -> ZoneInfo:
-    try:
-        return ZoneInfo(config.timezone)
-    except Exception:
-        return ZoneInfo("UTC")

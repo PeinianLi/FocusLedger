@@ -34,9 +34,9 @@ def build_report_data(
 ) -> dict[str, object]:
     """Aggregate one local day of raw samples into a JSON-serialisable report.
 
-    Everything here is derived at query time from raw events, matching the rest
-    of FocusLedger: nothing is read from a stored derived table. The HTML report
-    is a pure view over this dict.
+    Recent dates are derived from raw events; archived dates are read from the
+    cooked activity and attention segment tables. The HTML report is a pure
+    view over this dict.
     """
     policy = policy or AttentionPolicy()
     policy_config = config
@@ -74,11 +74,15 @@ def build_report_data(
             "labels": dict(CATEGORY_LABELS),
             "segments": [
                 {
-                    "start_min": _minutes_since_midnight(
-                        datetime.fromisoformat(str(row["started_at"]))
+                    "start_min": _timeline_minute(
+                        row,
+                        "started",
+                        datetime.fromisoformat(str(row["started_at"])),
                     ),
-                    "end_min": _minutes_since_midnight(
-                        datetime.fromisoformat(str(row["ended_at"]))
+                    "end_min": _timeline_minute(
+                        row,
+                        "ended",
+                        datetime.fromisoformat(str(row["ended_at"])),
                     ),
                     "category": str(row["category"]),
                     "matched_by": str(row["matched_by"]),
@@ -241,16 +245,17 @@ def _attention_segment(row: dict[str, object]) -> dict[str, object]:
     started_at = datetime.fromisoformat(str(row["started_at"]))
     ended_at = datetime.fromisoformat(str(row["ended_at"]))
     return {
-        "start_min": _minutes_since_midnight(started_at),
-        "end_min": _minutes_since_midnight(ended_at),
-        "start_label": started_at.strftime("%H:%M:%S"),
-        "end_label": ended_at.strftime("%H:%M:%S"),
+        "start_min": _timeline_minute(row, "started", started_at),
+        "end_min": _timeline_minute(row, "ended", ended_at),
+        "start_label": _time_label(started_at, row),
+        "end_label": _time_label(ended_at, row),
         "state": str(row["attention_state"]),
         "weight": float(row["attention_weight"] or 0.0),
         "duration_seconds": float(row["duration_seconds"] or 0.0),
         "max_idle_seconds": (
             None if row.get("max_idle_seconds") is None else float(row["max_idle_seconds"])
         ),
+        **_timezone_fields(row),
     }
 
 
@@ -258,13 +263,54 @@ def _activity_segment(row: dict[str, object]) -> dict[str, object]:
     started_at = datetime.fromisoformat(str(row["started_at"]))
     ended_at = datetime.fromisoformat(str(row["ended_at"]))
     return {
-        "start_min": _minutes_since_midnight(started_at),
-        "end_min": _minutes_since_midnight(ended_at),
-        "start_label": started_at.strftime("%H:%M:%S"),
-        "end_label": ended_at.strftime("%H:%M:%S"),
+        "start_min": _timeline_minute(row, "started", started_at),
+        "end_min": _timeline_minute(row, "ended", ended_at),
+        "start_label": _time_label(started_at, row),
+        "end_label": _time_label(ended_at, row),
         "process": str(row["process_name"] or "(unknown)"),
         "title": str(row["window_title"] or ""),
         "duration_seconds": float(row["duration_seconds"] or 0.0),
+        **_timezone_fields(row),
+    }
+
+
+def _timeline_minute(
+    row: dict[str, object],
+    prefix: str,
+    fallback: datetime,
+) -> float:
+    moment_utc = row.get(f"{prefix}_at_utc")
+    day_start_utc = row.get("local_day_start_utc")
+    if moment_utc and day_start_utc:
+        moment = datetime.fromisoformat(
+            str(moment_utc).replace("Z", "+00:00")
+        )
+        day_start = datetime.fromisoformat(
+            str(day_start_utc).replace("Z", "+00:00")
+        )
+        return (moment - day_start).total_seconds() / 60
+    return _minutes_since_midnight(fallback)
+
+
+def _time_label(moment: datetime, row: dict[str, object]) -> str:
+    timezone_name = row.get("timezone_name")
+    if timezone_name:
+        return f"{moment:%H:%M:%S} {timezone_name}"
+    offset = moment.strftime("%z")
+    if offset:
+        offset = f"{offset[:3]}:{offset[3:]}"
+        return f"{moment:%H:%M:%S} UTC{offset}"
+    return moment.strftime("%H:%M:%S")
+
+
+def _timezone_fields(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "timezone_id": row.get("timezone_id"),
+        "timezone_name": row.get("timezone_name"),
+        "utc_offset_seconds": row.get("utc_offset_seconds"),
+        "is_dst": (
+            None if row.get("is_dst") is None else bool(row["is_dst"])
+        ),
     }
 
 

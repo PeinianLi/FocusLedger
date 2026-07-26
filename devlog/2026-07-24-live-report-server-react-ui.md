@@ -1,7 +1,7 @@
 # Devlog: Live Report Server and React UI
 
-Updated: 2026-07-24 11:30  
-Author: Lichen Zhu  
+Updated: 2026-07-24
+Author: Lichen Zhu
 Baseline commit: `c5f91ef Add report command: interactive single-file HTML attention dashboard`
 
 ## Summary
