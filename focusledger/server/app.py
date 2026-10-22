@@ -543,10 +543,12 @@ def create_server(config: AppConfig, day: date, host: str = "127.0.0.1", port: i
 
 
 def serve_forever(server: ReportServer) -> None:
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    # Serve on the main thread: its select loop wakes every half second, which
+    # is when Ctrl+C gets through. A thread.join() here never wakes for it on
+    # Windows, so the server could not be stopped.
     try:
-        thread.join()
+        server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        server.shutdown()
+        pass
+    finally:
         server.server_close()
