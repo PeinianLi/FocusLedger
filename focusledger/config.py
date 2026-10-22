@@ -46,6 +46,9 @@ class AppConfig:
     llm_base_url: str
     llm_model: str
     llm_timeout_seconds: int
+    # The analyst calls tools over several turns, which needs a larger model
+    # than the one-shot review prose does.
+    llm_analyst_model: str
 
     def to_json_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -104,6 +107,7 @@ def build_default_config(data_dir: Path | None = None) -> AppConfig:
         llm_base_url="http://127.0.0.1:11434",
         llm_model="qwen2.5:1.5b",
         llm_timeout_seconds=120,
+        llm_analyst_model="qwen3.5:9b",
     )
 
 
@@ -157,6 +161,7 @@ def load_config() -> AppConfig:
         llm_base_url=str(merged["llm_base_url"]),
         llm_model=str(merged["llm_model"]),
         llm_timeout_seconds=int(merged["llm_timeout_seconds"]),
+        llm_analyst_model=str(merged["llm_analyst_model"]),
     )
 
 

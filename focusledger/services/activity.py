@@ -125,6 +125,24 @@ def list_timeline(conn: Connection, day: date) -> list[dict[str, object]]:
     return _list_archived_activity_segments(conn, day)
 
 
+def day_segments(
+    conn: Connection,
+    day: date,
+    attention_policy: AttentionPolicy | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """A day's activity and attention segments, reading its raw samples once."""
+    raw_rows = _list_raw_activity_events(conn, day)
+    if raw_rows:
+        return (
+            _derive_activity_segments(raw_rows),
+            _derive_attention_segments(raw_rows, attention_policy or AttentionPolicy()),
+        )
+    return (
+        _list_archived_activity_segments(conn, day),
+        _list_archived_attention_segments(conn, day),
+    )
+
+
 def summarize_by_app(conn: Connection, day: date) -> list[dict[str, object]]:
     summary: dict[str, dict[str, object]] = {}
     for segment in list_timeline(conn, day):

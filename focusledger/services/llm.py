@@ -115,6 +115,63 @@ def generate(config, system: str, user: str, timeout: float | None = None,
     return text
 
 
+def chat(
+    config,
+    messages: list[dict[str, object]],
+    *,
+    model: str | None = None,
+    tools: list[dict[str, object]] | None = None,
+    think: bool | None = None,
+    num_ctx: int | None = None,
+    temperature: float = 0.2,
+    timeout: float | None = None,
+) -> dict[str, object]:
+    """One raw ``/api/chat`` turn, tools included; returns Ollama's whole reply.
+
+    Unlike ``generate`` the caller keeps the conversation, so a model can call
+    tools across several turns. Raises ``LlmUnavailable`` on failure.
+    """
+    base_url = getattr(config, "llm_base_url", DEFAULT_BASE_URL).rstrip("/")
+    if not getattr(config, "llm_enabled", False):
+        raise LlmUnavailable("llm_enabled is false in config")
+
+    options: dict[str, object] = {"temperature": temperature}
+    if num_ctx:
+        options["num_ctx"] = num_ctx
+    payload: dict[str, object] = {
+        "model": model or getattr(config, "llm_model", ""),
+        "messages": messages,
+        "stream": False,
+        "options": options,
+    }
+    if tools:
+        payload["tools"] = tools
+    if think is not None:
+        payload["think"] = think
+    body = _http_post(
+        f"{base_url}/api/chat",
+        payload,
+        timeout=timeout or float(getattr(config, "llm_timeout_seconds", 120)),
+    )
+    try:
+        parsed = json.loads(body)
+    except ValueError as exc:
+        raise LlmUnavailable(f"model returned invalid JSON: {exc}") from exc
+    if not isinstance(parsed.get("message"), dict):
+        raise LlmUnavailable("model reply has no message")
+    return parsed
+
+
+def model_capabilities(config, model: str, timeout: float = 10.0) -> tuple[str, ...]:
+    """What a pulled model supports, e.g. ``("completion", "tools", "thinking")``."""
+    base_url = getattr(config, "llm_base_url", DEFAULT_BASE_URL).rstrip("/")
+    body = _http_post(f"{base_url}/api/show", {"model": model}, timeout=timeout)
+    try:
+        return tuple(str(c) for c in json.loads(body).get("capabilities") or ())
+    except (ValueError, AttributeError) as exc:
+        raise LlmUnavailable(f"cannot read capabilities of {model}: {exc}") from exc
+
+
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 

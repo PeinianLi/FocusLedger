@@ -348,6 +348,36 @@ python -m focusledger llm test        # 发一句话测试
 
 **没装也能用**：日报自动降级成确定性的规则版本，客观统计完全一致。
 
+### 让模型分析你的数据：analyst
+
+`analyst` 让本地模型先通过一组只读工具查数据，再回答问题。所有数字都由 Python 算好，模型只负责决定查什么、怎么说。
+答案里如果出现工具结果里没有的数字，会被打回去重写；重写后仍有，就在结尾标出警告。
+
+```bash
+python -m focusledger analyst ask "上周我的时间主要花在哪里？"
+python -m focusledger analyst ask "8 月 7 日哪段时间最专注？" --trace        # 显示每次工具调用
+python -m focusledger analyst ask "..." --model deepseek-r1:8b              # 临时换模型
+python -m focusledger analyst eval --models qwen3.5:9b,qwen3:8b --out eval.json   # 多个模型跑同一套问题
+python -m focusledger analyst tools                                          # 列出模型能用的工具
+python -m focusledger analyst tool day_summary --args '{"date": "2026-08-07"}'     # 不经模型，直接跑一个工具
+```
+
+- 默认模型是配置里的 `llm_analyst_model`（默认 `qwen3.5:9b`）。分析要多轮调用工具，日报用的 1.5B 小模型不够用，建议 8B 以上。
+- 工具调用有两种方式：`native` 走 Ollama 原生的工具调用；`text` 让模型在回复里写一段 JSON。默认 `auto` 会先试探一次：模型不会原生调用工具时（比如 `deepseek-r1:8b`），自动改用 `text`。
+- `--think` / `--no-think` 开关模型的思考模式，`--num-ctx` 调上下文长度（默认 16384），`--tool-mode` 强制指定工具调用方式。
+- 可用工具：`list_days`、`day_summary`、`range_summary`、`compare_ranges`、`app_usage`、`timeline`、`hourly_profile`、`deliverables`，全部只读。
+
+本机实测（RTX 5070 12 GB，Ollama 0.40，`analyst eval` 内置的 5 道题，2026-10-22，答案逐条对照工具结果人工核对）：
+
+| 模型 | 工具调用方式 | 完全正确 | 中位耗时 | 问题 |
+|---|---|---:|---:|---|
+| `qwen3.5:9b` | native | 5/5 | 22 秒 | 没有一次需要打回 |
+| `qwen3:8b` | native | 2/5 | 32 秒 | 自己算占比；区间对比选错日期、方向说反；把锁屏时间说错 |
+| `deepseek-r1:8b` | text | 2/5 | 55 秒 | 不会原生调用工具；把"游戏"当应用名去搜；读错每小时数据 |
+
+DeepSeek 更新的 V4 系列在 Ollama 上只有云端版本（`deepseek-v4.1-flash:cloud` 等），会把数据发到 Ollama 服务器，
+不符合本项目"数据不出机器"的原则，所以没有接入；本地能跑的最新 DeepSeek 权重是 `deepseek-r1:8b`。
+
 ## 14. 日报与明日计划
 
 ```bash
