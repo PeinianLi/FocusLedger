@@ -128,12 +128,15 @@ CREATE TABLE IF NOT EXISTS workday_sessions (
     updated_at TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_workday_sessions_key
-    ON workday_sessions(device_id, workday_key);
+-- Samples belong to the device that captured them; a workday and everything
+-- the user writes about it (notes, review) is one per day across devices, so
+-- device_id on a session only records where it was started.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workday_sessions_workday_key
+    ON workday_sessions(workday_key);
 
 CREATE TABLE IF NOT EXISTS workday_pauses (
     id TEXT PRIMARY KEY,
-    workday_id TEXT NOT NULL,
+    workday_id TEXT NOT NULL REFERENCES workday_sessions(id),
     started_at TEXT NOT NULL,
     ended_at TEXT,
     reason TEXT,
@@ -152,6 +155,9 @@ CREATE TABLE IF NOT EXISTS classification_rules (
     note TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_classification_rules_target
+    ON classification_rules(match_type, pattern);
 
 CREATE TABLE IF NOT EXISTS manual_corrections (
     id TEXT PRIMARY KEY,
@@ -178,7 +184,7 @@ CREATE TABLE IF NOT EXISTS deliverables (
 
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
-    deliverable_id TEXT,
+    deliverable_id TEXT REFERENCES deliverables(id),
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
     estimate_minutes INTEGER,

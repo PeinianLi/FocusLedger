@@ -48,8 +48,7 @@ def apply_retention(
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local_now = _as_system_local(current, local_timezone)
-    keep_from_date = local_now.date() - timedelta(days=retention_days - 1)
+    keep_from_date = _keep_from_date(current, retention_days, local_timezone)
     archive_dates = _archive_dates(conn, keep_from_date)
 
     totals = RetentionResult()
@@ -115,6 +114,31 @@ def apply_retention(
         activity_segments_written=totals.activity_segments_written,
         attention_segments_written=totals.attention_segments_written,
     )
+
+
+def pending_archive_dates(
+    conn: Connection,
+    retention_days: int,
+    now: datetime | None = None,
+    local_timezone: tzinfo | None = None,
+) -> list[date]:
+    """Local dates past the raw retention window that are not archived yet.
+
+    Archiving runs from the agent loop, so these pile up while it is stopped.
+    """
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return _archive_dates(conn, _keep_from_date(current, retention_days, local_timezone))
+
+
+def _keep_from_date(
+    current: datetime,
+    retention_days: int,
+    local_timezone: tzinfo | None,
+) -> date:
+    local_now = _as_system_local(current, local_timezone)
+    return local_now.date() - timedelta(days=retention_days - 1)
 
 
 def _archive_dates(conn: Connection, keep_from_date: date) -> list[date]:

@@ -10,7 +10,7 @@ Resolution order follows the spec, most specific first:
     1. manual correction
     2. deliverable-linked rule
     3. site rule
-    4. process/app rule
+    4. process/app rule, then the app's install folder (game stores)
     5. title keyword rule
     6. fallback unknown
 """
@@ -101,18 +101,27 @@ class Classification:
 # --------------------------------------------------------------------------
 _PROCESS_RULES: list[tuple[frozenset[str], str]] = [
     (frozenset({"code", "visual studio code", "code.exe", "pycharm", "pycharm.exe", "intellij idea",
+                "pycharm64.exe", "idea64.exe", "webstorm64.exe", "clion64.exe", "goland64.exe",
+                "rider64.exe", "datagrip64.exe",
                 "webstorm", "clion", "goland", "rider", "sublime text", "vim", "nvim", "emacs",
-                "xcode", "android studio", "cursor", "zed", "terminal", "iterm2", "warp",
+                "xcode", "android studio", "cursor", "codex", "codex.exe", "zed", "terminal",
+                "iterm2", "warp",
                 "windowsterminal.exe", "powershell.exe", "cmd.exe", "alacritty", "kitty",
-                "wezterm", "docker desktop", "postman", "tableplus", "dbeaver"}), PRODUCTIVE_CORE),
-    (frozenset({"steam", "steam.exe", "epicgameslauncher.exe", "battle.net", "riotclientux.exe",
-                "leagueclient.exe", "minecraft", "eu4", "dota2", "csgo", "cs2"}), GAMING),
+                "wezterm", "docker desktop", "postman", "tableplus", "dbeaver",
+                "pgadmin4.exe"}), PRODUCTIVE_CORE),
+    (frozenset({"steam", "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "battle.net",
+                "riotclientux.exe", "leagueclient.exe", "minecraft", "eu4", "dota2", "csgo",
+                "cs2"}), GAMING),
     (frozenset({"discord", "discord.exe"}), SOCIAL),
     (frozenset({"slack", "slack.exe", "microsoft teams", "teams.exe", "zoom.us", "zoom.exe",
-                "wechat", "微信", "telegram", "signal", "lark", "feishu", "飞书"}), COMMUNICATION),
+                "wechat", "weixin.exe", "微信", "telegram", "signal", "lark", "feishu",
+                "飞书"}), COMMUNICATION),
+    # The desktop apps get the same conservative label as chatgpt.com/claude.ai.
+    (frozenset({"chatgpt", "chatgpt.exe", "claude", "claude.exe"}), NEUTRAL_EDUCATIONAL),
     (frozenset({"spotify", "spotify.exe", "vlc", "quicktime player", "netflix", "iina",
                 "music", "tv"}), ENTERTAINMENT),
-    (frozenset({"mail", "outlook", "outlook.exe", "microsoft outlook", "calendar", "reminders",
+    (frozenset({"mail", "outlook", "outlook.exe", "olk.exe", "microsoft outlook", "calendar",
+                "reminders",
                 "notes", "finder", "explorer.exe", "system settings", "system preferences",
                 "activity monitor", "task manager", "1password", "keychain access"}), ADMIN),
     (frozenset({"notion", "obsidian", "logseq", "typora", "zotero", "mendeley",
@@ -157,6 +166,19 @@ _ENTERTAINMENT_TITLE_HINTS = (
 _GAMING_TITLE_HINTS = ("steam", "gameplay", "speedrun", "ranked match")
 
 
+# Install folders of game stores. A game's executable name is arbitrary
+# (Dangan3Win.exe, swhaop.exe), but where the store installs it is not.
+_GAME_LIBRARY_PATH_HINTS = (
+    "/steamapps/common/",
+    "/epic games/",
+    "/gog galaxy/games/",
+    "/xboxgames/",
+    "/riot games/",
+    "/ubisoft game launcher/games/",
+    "/ea games/",
+)
+
+
 def _match_process(process_name: str | None) -> str | None:
     if not process_name:
         return None
@@ -164,6 +186,16 @@ def _match_process(process_name: str | None) -> str | None:
     for names, category in _PROCESS_RULES:
         if key in names:
             return category
+    return None
+
+
+def _match_install_path(executable_path: str | None) -> str | None:
+    if not executable_path:
+        return None
+    normalized = executable_path.replace("\\", "/").lower()
+    for hint in _GAME_LIBRARY_PATH_HINTS:
+        if hint in normalized:
+            return hint.strip("/")
     return None
 
 
@@ -307,6 +339,7 @@ def classify(
     process_name: str | None,
     window_title: str | None,
     context: dict[str, object] | None = None,
+    executable_path: str | None = None,
 ) -> Classification:
     """Resolve one activity segment to a category."""
     context = context or {"corrections": {s: {} for s in SCOPES},
@@ -357,6 +390,9 @@ def classify(
         # A browser process alone says nothing about what is on screen.
         if not browser.is_browser:
             return Classification(process_category, MATCH_PROCESS, key, site=site)
+    game_library = _match_install_path(executable_path)
+    if game_library and not browser.is_browser:
+        return Classification(GAMING, MATCH_PROCESS, game_library, site=site)
 
     # 6. title keyword
     title_category = _match_title(effective_title)
@@ -378,6 +414,7 @@ def classify_segments(
             str(segment.get("process") or segment.get("process_name") or ""),
             str(segment.get("title") or segment.get("window_title") or ""),
             context,
+            executable_path=segment.get("executable_path"),  # type: ignore[arg-type]
         )
         enriched = dict(segment)
         enriched["category"] = result.category

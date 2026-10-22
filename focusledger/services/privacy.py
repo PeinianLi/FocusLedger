@@ -137,6 +137,8 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
             ]
 
     raw_ids.extend(_private_handleless_raw_ids(conn))
+    if _table_exists(conn, "activity_segments"):
+        segment_ids = list(dict.fromkeys([*segment_ids, *_private_marked_segment_ids(conn)]))
 
     raw_redacted = 0
     segments_redacted = 0
@@ -187,6 +189,27 @@ def _private_handleless_raw_ids(conn: Connection) -> list[str]:
         LEFT JOIN applications a ON a.id = r.application_id
         WHERE r.window_handle IS NULL
           AND (r.window_title IS NULL OR r.window_title != ?)
+        """,
+        (PRIVATE_BROWSER_TITLE,),
+    ).fetchall()
+    return [
+        row["id"]
+        for row in rows
+        if _is_browser(row["process_name"]) and _title_marks_private(row["window_title"])
+    ]
+
+
+def _private_marked_segment_ids(conn: Connection) -> list[str]:
+    """Archived segments whose own title still carries a private marker.
+
+    Archiving drops window handles along with the raw events, so the sticky
+    per-window rule cannot reach those days; the title rule still can, for
+    example after a new marker is added.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, process_name, window_title FROM activity_segments
+        WHERE window_title IS NULL OR window_title != ?
         """,
         (PRIVATE_BROWSER_TITLE,),
     ).fetchall()

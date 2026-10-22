@@ -26,6 +26,8 @@ from focusledger.services.alerts import (
 )
 from focusledger.services.browser import parse_browser_context
 from focusledger.services.classify import (
+    ADMIN,
+    COMMUNICATION,
     ENTERTAINMENT,
     GAMING,
     LEARNING_GENERAL,
@@ -35,6 +37,7 @@ from focusledger.services.classify import (
     add_correction,
     attach_attention_weight,
     classify,
+    classify_segments,
     load_rule_context,
     unknown_targets,
 )
@@ -206,6 +209,46 @@ class ClassifyTests(Fixture):
 
     def test_steam_is_gaming(self) -> None:
         self.assertEqual(classify("Steam", "Steam").category, GAMING)
+
+    def test_game_store_install_folder_is_gaming(self) -> None:
+        windows_path = (
+            "C:\\Program Files (x86)\\Steam\\steamapps\\common\\"
+            "Danganronpa V3 Killing Harmony\\Dangan3Win.exe"
+        )
+        mac_path = (
+            "/Users/me/Library/Application Support/Steam/steamapps/common/"
+            "Terraria/Terraria.app"
+        )
+        self.assertEqual(
+            classify("Dangan3Win.exe", "Danganronpa V3", executable_path=windows_path).category,
+            GAMING,
+        )
+        self.assertEqual(
+            classify("Terraria", "Terraria", executable_path=mac_path).category, GAMING
+        )
+        self.assertEqual(classify("Dangan3Win.exe", "Danganronpa V3").category, UNKNOWN)
+        segments = classify_segments(
+            [{"process_name": "Dangan3Win.exe", "window_title": "Danganronpa V3",
+              "executable_path": windows_path}],
+            load_rule_context(self.conn),
+        )
+        self.assertEqual(segments[0]["category"], GAMING)
+
+    def test_correction_overrides_the_game_library_rule(self) -> None:
+        # Steam also distributes tools, so a correction still has to win.
+        add_correction(self.conn, "dev", SCOPE_PROCESS, "blender.exe", PRODUCTIVE_CORE)
+        result = classify(
+            "blender.exe",
+            "Blender",
+            load_rule_context(self.conn),
+            executable_path="D:\\SteamLibrary\\steamapps\\common\\Blender\\blender.exe",
+        )
+        self.assertEqual(result.category, PRODUCTIVE_CORE)
+
+    def test_common_windows_binaries_are_known(self) -> None:
+        self.assertEqual(classify("pycharm64.exe", "report.py").category, PRODUCTIVE_CORE)
+        self.assertEqual(classify("Weixin.exe", "\u5fae\u4fe1").category, COMMUNICATION)
+        self.assertEqual(classify("olk.exe", "Inbox").category, ADMIN)
 
     def test_manual_correction_wins_over_built_in_rules(self) -> None:
         add_correction(self.conn, "dev", SCOPE_PROCESS, "steam", PRODUCTIVE_CORE)

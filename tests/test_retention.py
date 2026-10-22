@@ -14,7 +14,7 @@ from focusledger.services.activity import (
     summarize_attention,
 )
 from focusledger.services.attention import AttentionPolicy
-from focusledger.services.retention import apply_retention
+from focusledger.services.retention import apply_retention, pending_archive_dates
 
 
 def snapshot(
@@ -122,6 +122,26 @@ class RetentionTests(unittest.TestCase):
             )
             conn.close()
 
+    def test_pending_archive_dates_lists_unarchived_old_days(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            for day in (1, 2, 20):
+                self._insert_event(
+                    conn, datetime(2026, 7, day, 9, 0, tzinfo=timezone.utc), "Day", 0
+                )
+            now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+
+            before = pending_archive_dates(conn, 7, now, timezone.utc)
+            self._run(conn)
+            after = pending_archive_dates(conn, 7, now, timezone.utc)
+            conn.close()
+
+            self.assertEqual(
+                [d.isoformat() for d in before], ["2026-07-01", "2026-07-02"]
+            )
+            self.assertEqual(after, [])
+
     def test_current_seven_local_dates_remain_raw(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conn = connect(Path(tmp) / "focusledger.sqlite3")
@@ -196,6 +216,108 @@ class RetentionTests(unittest.TestCase):
 
             self.assertEqual(after["per_app"], before["per_app"])
             conn.close()
+
+    def test_idle_stretch_before_midnight_is_not_counted_twice(self) -> None:
+        # Input stops at 16:30 and returns at 08:00 the next morning. The next
+        # day's first sample backdates that idle to 16:30, but only the part
+        # after its own midnight belongs to it.
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            evening = datetime(2026, 7, 16, 16, 30, tzinfo=timezone.utc)
+            midnight = datetime(2026, 7, 17, tzinfo=timezone.utc)
+            self._insert_event(conn, evening, "Editor", 0.0)
+            self._insert_event(
+                conn, midnight - timedelta(seconds=1), "Editor", 7.5 * 3600 - 1
+            )
+            self._insert_event(
+                conn, midnight + timedelta(seconds=1), "Editor", 7.5 * 3600 + 1
+            )
+            self._insert_event(conn, midnight + timedelta(hours=8), "Editor", 0.0)
+
+            def check(stage: str) -> None:
+                previous = list_attention_segments(conn, evening.date())
+                today = list_attention_segments(conn, midnight.date())
+                summary = summarize_attention(
+                    conn, midnight.date(), poll_interval_seconds=1
+                )
+                with self.subTest(stage):
+                    self.assertEqual(today[0]["started_at"], midnight.isoformat())
+                    self.assertEqual(today[0]["attention_state"], "hard_idle")
+                    self.assertEqual(summary["hard_idle_seconds"], 8 * 3600)
+                    self.assertLessEqual(
+                        previous[-1]["ended_at"], today[0]["started_at"]
+                    )
+
+            check("raw")
+            self._run(conn)
+            check("archived")
+            conn.close()
+
+    def test_attention_archived_before_clipping_is_clipped_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            conn.execute(
+                """
+                INSERT INTO attention_segments(
+                    id, local_date, device_id, started_at, ended_at,
+                    started_at_utc, ended_at_utc, local_day_start_utc,
+                    duration_seconds, attention_state, attention_weight,
+                    max_idle_seconds, source, created_at, updated_at
+                )
+                VALUES (
+                    'legacy', '2026-07-17', 'device_test',
+                    '2026-07-16T12:30:00-04:00', '2026-07-17T04:00:00-04:00',
+                    '2026-07-16T16:30:00+00:00', '2026-07-17T08:00:00+00:00',
+                    '2026-07-17T00:00:00+00:00', 55800, 'hard_idle', 0, 55800,
+                    'retention_archive', 'now', 'now'
+                )
+                """
+            )
+            conn.commit()
+
+            rows = list_attention_segments(
+                conn, datetime(2026, 7, 17, tzinfo=timezone.utc).date()
+            )
+            conn.close()
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["started_at"], "2026-07-16T20:00:00-04:00")
+            self.assertEqual(rows[0]["started_at_utc"], "2026-07-17T00:00:00+00:00")
+            self.assertEqual(rows[0]["duration_seconds"], 8 * 3600)
+
+    def test_attention_without_stored_day_start_is_clipped_at_local_midnight(self) -> None:
+        # Days archived before v7 have no local_day_start_utc; the segment's own
+        # UTC offset still places local midnight.
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            conn.execute(
+                """
+                INSERT INTO attention_segments(
+                    id, local_date, device_id, started_at, ended_at,
+                    started_at_utc, ended_at_utc, duration_seconds,
+                    attention_state, attention_weight, max_idle_seconds, source,
+                    created_at, updated_at
+                )
+                VALUES (
+                    'legacy', '2026-07-21', 'device_test',
+                    '2026-07-20T23:20:00-04:00', '2026-07-21T05:00:00-04:00',
+                    '2026-07-21T03:20:00+00:00', '2026-07-21T09:00:00+00:00',
+                    20400, 'hard_idle', 0, 20400, 'retention_archive', 'now', 'now'
+                )
+                """
+            )
+            conn.commit()
+
+            rows = list_attention_segments(
+                conn, datetime(2026, 7, 21, tzinfo=timezone.utc).date()
+            )
+            conn.close()
+
+            self.assertEqual(rows[0]["started_at"], "2026-07-21T00:00:00-04:00")
+            self.assertEqual(rows[0]["duration_seconds"], 5 * 3600)
 
     @staticmethod
     def _insert_event(

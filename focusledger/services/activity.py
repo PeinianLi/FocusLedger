@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from sqlite3 import Connection
 
 from focusledger.models import ActiveWindowSnapshot
@@ -312,14 +312,16 @@ def _list_archived_attention_segments(
             attention_state,
             attention_weight,
             max_idle_seconds,
-            source
+            source,
+            local_date
         FROM attention_segments
         WHERE local_date = ?
         ORDER BY COALESCE(started_at_utc, started_at) ASC
         """,
         (day.isoformat(),),
     ).fetchall()
-    return [dict(row) for row in rows]
+    # Days archived before clipping existed still carry the backdated stretch.
+    return _clip_to_local_day([dict(row) for row in rows])
 
 
 def _summarize_attention_by_app(
@@ -392,11 +394,7 @@ def _summarize_attention_by_app(
 
 
 def _segment_utc(row: dict[str, object], prefix: str) -> datetime:
-    value = row.get(f"{prefix}_at_utc") or row[f"{prefix}_at"]
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return _parse_utc(row.get(f"{prefix}_at_utc") or row[f"{prefix}_at"])
 
 
 def _derive_activity_segments(
@@ -534,7 +532,71 @@ def _derive_attention_segments(
             segment_gap_seconds,
         )
     _attach_attention_time_context(output, rows)
-    return output
+    return _clip_to_local_day(output)
+
+
+def _clip_to_local_day(segments: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Drop the part of a day's attention segments that falls before its start.
+
+    The first sample of a day backdates its idle stretch to the last input,
+    which can be hours before midnight. That stretch already belongs to the
+    previous day, so keeping it counted it twice and pushed a day's attention
+    total past 24 hours.
+    """
+    day_starts = [
+        _parse_utc(segment["local_day_start_utc"])
+        for segment in segments
+        if segment.get("local_day_start_utc")
+    ]
+    day_start = min(day_starts) if day_starts else _local_midnight_utc(segments)
+    if day_start is None:
+        return segments
+
+    clipped: list[dict[str, object]] = []
+    for segment in segments:
+        started_at_utc = _segment_utc(segment, "started")
+        if started_at_utc >= day_start:
+            clipped.append(segment)
+            continue
+        ended_at_utc = _segment_utc(segment, "ended")
+        if ended_at_utc <= day_start:
+            continue
+        local_start = datetime.fromisoformat(str(segment["started_at"]))
+        clipped.append(
+            {
+                **segment,
+                "started_at": (
+                    day_start.astimezone(local_start.tzinfo)
+                    if local_start.tzinfo
+                    else day_start
+                ).isoformat(),
+                "started_at_utc": day_start.isoformat(),
+                "duration_seconds": (ended_at_utc - day_start).total_seconds(),
+            }
+        )
+    return clipped
+
+
+def _local_midnight_utc(segments: list[dict[str, object]]) -> datetime | None:
+    """Local midnight of the segments' date, for rows archived before v7 stored
+    each day's start. The last segment's offset stands in for the day's."""
+    dates = {segment.get("local_date") for segment in segments} - {None}
+    if len(dates) != 1 or not segments:
+        return None
+    reference = datetime.fromisoformat(str(segments[-1]["ended_at"]))
+    if reference.tzinfo is None:
+        return None
+    midnight = datetime.combine(
+        date.fromisoformat(str(dates.pop())), time.min, tzinfo=reference.tzinfo
+    )
+    return midnight.astimezone(timezone.utc)
+
+
+def _parse_utc(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _attach_attention_time_context(

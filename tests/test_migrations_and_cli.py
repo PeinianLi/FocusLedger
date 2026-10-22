@@ -18,7 +18,7 @@ from focusledger.agent.runner import _system_local_date
 from focusledger.cli import build_parser, heartbeat_age_seconds, render_attention_timeline
 from focusledger.config import build_default_config, load_config
 from focusledger.db.connection import connect
-from focusledger.db.migrations import SCHEMA_VERSION, apply_migrations
+from focusledger.db.migrations import SCHEMA_VERSION, SchemaTooNewError, apply_migrations
 from focusledger.services.activity import _list_raw_activity_events
 
 
@@ -83,7 +83,7 @@ class MigrationAndCliTests(unittest.TestCase):
             self.assertNotIn("attention_state", columns)
             self.assertNotIn("attention_weight", columns)
             self.assertIsNotNone(attention_table)
-            self.assertEqual(version, SCHEMA_VERSION)
+            self.assertEqual(version, str(SCHEMA_VERSION))
             self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0]["captured_at"], "2026-07-01T09:00:00-04:00")
             self.assertEqual(samples[0]["process_name"], "Code.exe")
@@ -201,6 +201,102 @@ class MigrationAndCliTests(unittest.TestCase):
             self.assertEqual(len(_list_raw_activity_events(conn, date(2026, 7, 24))), 3)
             conn.close()
 
+    def test_newer_database_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+            with self.assertRaises(SchemaTooNewError):
+                apply_migrations(conn)
+            conn.close()
+
+    def test_v9_database_gains_foreign_keys_and_a_global_workday_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "focusledger.sqlite3"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE workday_sessions (
+                    id TEXT PRIMARY KEY, device_id TEXT NOT NULL, workday_key TEXT NOT NULL,
+                    started_at TEXT NOT NULL, ended_at TEXT, timezone TEXT, status TEXT NOT NULL,
+                    is_overtime INTEGER NOT NULL DEFAULT 0, offwork_target_time TEXT,
+                    review_status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX idx_workday_sessions_key
+                    ON workday_sessions(device_id, workday_key);
+                CREATE TABLE workday_pauses (
+                    id TEXT PRIMARY KEY, workday_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                    ended_at TEXT, reason TEXT, created_at TEXT NOT NULL
+                );
+                CREATE TABLE deliverables (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active', priority INTEGER NOT NULL DEFAULT 2,
+                    due_date TEXT, match_keywords TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, deliverable_id TEXT, title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open', estimate_minutes INTEGER,
+                    blocker TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                INSERT INTO workday_sessions(id, device_id, workday_key, started_at, status,
+                                             created_at, updated_at)
+                VALUES ('s1', 'device_a', '2026-07-24', 'now', 'ended', 'now', 'now');
+                INSERT INTO workday_pauses VALUES ('p1', 's1', 'now', NULL, 'lunch', 'now');
+                INSERT INTO deliverables(id, title, created_at, updated_at)
+                VALUES ('d1', 'Report', 'now', 'now');
+                INSERT INTO tasks(id, deliverable_id, title, created_at, updated_at)
+                VALUES ('t1', 'd1', 'Draft', 'now', 'now'),
+                       ('t2', 'gone', 'Orphan', 'now', 'now');
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            conn = connect(db_path)
+            apply_migrations(conn)
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            task_keys = conn.execute("PRAGMA foreign_key_list(tasks)").fetchall()
+            pause_keys = conn.execute("PRAGMA foreign_key_list(workday_pauses)").fetchall()
+            tasks = dict(
+                conn.execute("SELECT id, deliverable_id FROM tasks").fetchall()
+            )
+            pauses = conn.execute("SELECT id FROM workday_pauses").fetchall()
+            indexes = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO workday_sessions(id, device_id, workday_key, started_at,
+                                                 status, created_at, updated_at)
+                    VALUES ('s2', 'device_b', '2026-07-24', 'now', 'active', 'now', 'now')
+                    """
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO tasks(id, deliverable_id, title, created_at, updated_at) "
+                    "VALUES ('t3', 'missing', 'x', 'now', 'now')"
+                )
+            conn.rollback()
+
+            # Already current: a second run changes nothing.
+            apply_migrations(conn)
+            conn.close()
+
+            self.assertEqual(user_version, SCHEMA_VERSION)
+            self.assertEqual(task_keys[0]["table"], "deliverables")
+            self.assertEqual(pause_keys[0]["table"], "workday_sessions")
+            self.assertEqual(tasks, {"t1": "d1", "t2": None})
+            self.assertEqual(len(pauses), 1)
+            self.assertNotIn("idx_workday_sessions_key", indexes)
+            self.assertIn("idx_workday_sessions_workday_key", indexes)
+            self.assertIn("idx_tasks_deliverable", indexes)
+            self.assertIn("idx_classification_rules_target", indexes)
+
     def test_v5_phase_tables_and_v7_cooked_tables_coexist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             conn = connect(Path(tmp) / "focusledger.sqlite3")
@@ -257,7 +353,7 @@ class MigrationAndCliTests(unittest.TestCase):
             conn.close()
 
             self.assertIsNone(table)
-            self.assertEqual(version, SCHEMA_VERSION)
+            self.assertEqual(version, str(SCHEMA_VERSION))
 
     def test_legacy_derived_tables_receive_local_date(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

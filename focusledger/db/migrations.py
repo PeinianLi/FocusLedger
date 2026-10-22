@@ -5,12 +5,27 @@ from importlib.resources import files
 from sqlite3 import Connection
 
 
-SCHEMA_VERSION = "9"
+# The schema version lives in SQLite's own user_version header field. Each
+# step below runs once, in order, for databases older than its number.
+SCHEMA_VERSION = 10
 
 LOGGER = logging.getLogger(__name__)
 
 
+class SchemaTooNewError(RuntimeError):
+    """The database was written by a newer FocusLedger than this one."""
+
+
 def apply_migrations(conn: Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise SchemaTooNewError(
+            f"database schema v{version} is newer than this FocusLedger "
+            f"(v{SCHEMA_VERSION}); update FocusLedger before using this database"
+        )
+    if version == SCHEMA_VERSION:
+        return
+
     # This setting must be selected before a new database gets its first table.
     # Existing databases retain their current mode until a full VACUUM, while
     # still reusing pages released by retention.
@@ -20,6 +35,30 @@ def apply_migrations(conn: Connection) -> None:
     if not has_tables:
         conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
 
+    for target, step in _STEPS:
+        if version < target:
+            step(conn)
+            conn.execute(f"PRAGMA user_version = {target}")
+            conn.commit()
+            version = target
+    conn.execute(
+        """
+        INSERT INTO app_metadata(key, value, updated_at)
+        VALUES ('schema_version', ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (str(SCHEMA_VERSION),),
+    )
+    conn.commit()
+
+
+def _baseline_v9(conn: Connection) -> None:
+    """Bring a database from before version numbers (user_version 0) to v9.
+
+    Releases up to v9 kept no version, so this step works from what it finds:
+    the schema script fills in missing tables and the checks below upgrade
+    older table shapes in place. It is safe to run on any of them.
+    """
     schema = files("focusledger.db").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema)
 
@@ -89,15 +128,103 @@ def apply_migrations(conn: Connection) -> None:
     # Per-app attention is calculated by intersecting the two cooked segment
     # streams. Remove the redundant v6 summary table if it is present.
     conn.execute("DROP TABLE IF EXISTS daily_app_attention")
+    conn.commit()
+
+
+def _migrate_v10(conn: Connection) -> None:
+    """Key workdays by date alone and give tasks and pauses foreign keys."""
+    # Replaced by the workday_key-only index from the schema script: a session
+    # keyed per device let a regenerated device_id open a second copy of a day.
+    conn.execute("DROP INDEX IF EXISTS idx_workday_sessions_key")
     conn.execute(
         """
-        INSERT INTO app_metadata(key, value, updated_at)
-        VALUES ('schema_version', ?, datetime('now'))
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
-        (SCHEMA_VERSION,),
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workday_sessions_workday_key
+        ON workday_sessions(workday_key)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_classification_rules_target
+        ON classification_rules(match_type, pattern)
+        """
     )
     conn.commit()
+
+    # SQLite only adds a foreign key by rebuilding the table.
+    rebuilds = [
+        (table, ddl)
+        for table, ddl in (("tasks", _TASKS_V10), ("workday_pauses", _WORKDAY_PAUSES_V10))
+        if not conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+    ]
+    if rebuilds:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # A reference to a row that no longer exists would break the new key.
+            conn.execute(
+                """
+                UPDATE tasks SET deliverable_id = NULL
+                WHERE deliverable_id NOT IN (SELECT id FROM deliverables)
+                """
+            )
+            conn.execute(
+                """
+                DELETE FROM workday_pauses
+                WHERE workday_id NOT IN (SELECT id FROM workday_sessions)
+                """
+            )
+            for table, ddl in rebuilds:
+                conn.execute(ddl.format(table=f"{table}_v10"))
+                columns = ", ".join(
+                    column
+                    for column in _column_order(conn, f"{table}_v10")
+                    if column in _columns(conn, table)
+                )
+                conn.execute(
+                    f"INSERT INTO {table}_v10({columns}) SELECT {columns} FROM {table}"
+                )
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {table}_v10 RENAME TO {table}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+    # Dropping a table drops its indexes; recreate them for rebuilt tables.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_deliverable ON tasks(deliverable_id)")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workday_pauses_workday
+        ON workday_pauses(workday_id, started_at)
+        """
+    )
+    conn.commit()
+
+
+_TASKS_V10 = """
+    CREATE TABLE {table} (
+        id TEXT PRIMARY KEY,
+        deliverable_id TEXT REFERENCES deliverables(id),
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        estimate_minutes INTEGER,
+        blocker TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+"""
+
+_WORKDAY_PAUSES_V10 = """
+    CREATE TABLE {table} (
+        id TEXT PRIMARY KEY,
+        workday_id TEXT NOT NULL REFERENCES workday_sessions(id),
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        reason TEXT,
+        created_at TEXT NOT NULL
+    )
+"""
 
 
 def _upgrade_legacy_raw_columns(conn: Connection) -> None:
@@ -279,10 +406,20 @@ def _rebuild_raw_storage(conn: Connection, *, legacy_raw: bool) -> None:
 
 
 def _columns(conn: Connection, table: str) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return set(_column_order(conn, table))
+
+
+def _column_order(conn: Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
 def _ensure_column(conn: Connection, table: str, column: str, decl: str) -> None:
     existing = _columns(conn, table)
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+_STEPS = (
+    (9, _baseline_v9),
+    (10, _migrate_v10),
+)

@@ -499,6 +499,47 @@ class ActivitySegmentTests(unittest.TestCase):
             self.assertEqual(segment_title, PRIVATE_BROWSER_TITLE)
             conn.close()
 
+    def test_archived_private_titles_are_redacted_without_raw_events(self) -> None:
+        # Archived days have no raw events, so only the segment's own title
+        # can mark it as private.
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = open_db(Path(tmp) / "focusledger.sqlite3")
+            base = datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc)
+            for segment_id, title in (
+                ("private", "New Incognito Tab - Google Chrome"),
+                ("normal", "Example Domain - Google Chrome"),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO activity_segments(
+                        id, local_date, device_id, started_at, ended_at, duration_seconds,
+                        process_name, window_title, executable_path, source,
+                        created_at, updated_at
+                    )
+                    VALUES (?, '2026-06-08', 'device_test', ?, ?, 60, 'chrome.exe', ?,
+                            'chrome.exe', 'retention_archive', ?, ?)
+                    """,
+                    (
+                        segment_id,
+                        base.isoformat(),
+                        (base + timedelta(minutes=1)).isoformat(),
+                        title,
+                        base.isoformat(),
+                        base.isoformat(),
+                    ),
+                )
+            conn.commit()
+
+            counts = redact_existing_private_browser_titles(conn)
+            titles = dict(
+                conn.execute("SELECT id, window_title FROM activity_segments").fetchall()
+            )
+            conn.close()
+
+            self.assertEqual(counts["activity_segments"], 1)
+            self.assertEqual(titles["private"], PRIVATE_BROWSER_TITLE)
+            self.assertEqual(titles["normal"], "Example Domain - Google Chrome")
+
 
 if __name__ == "__main__":
     unittest.main()

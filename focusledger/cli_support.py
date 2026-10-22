@@ -11,7 +11,7 @@ from datetime import date, datetime
 
 from focusledger.config import AppConfig, ensure_config, load_config
 from focusledger.db.connection import connect
-from focusledger.db.migrations import apply_migrations
+from focusledger.db.migrations import SchemaTooNewError, apply_migrations
 from focusledger.services.activity import format_duration
 from focusledger.services import workday as workday_service
 
@@ -19,7 +19,10 @@ from focusledger.services import workday as workday_service
 def ensure_initialized() -> AppConfig:
     cfg = ensure_config()
     with connect(cfg.database_path) as conn:
-        apply_migrations(conn)
+        try:
+            apply_migrations(conn)
+        except SchemaTooNewError as exc:
+            raise SystemExit(str(exc)) from exc
     return load_config()
 
 

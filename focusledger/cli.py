@@ -31,7 +31,7 @@ from focusledger.services.activity import (
 from focusledger.services.attention import AttentionPolicy
 from focusledger.services.dev import reset_database
 from focusledger.services.privacy import redact_existing_private_browser_titles
-from focusledger.services.retention import apply_retention
+from focusledger.services.retention import apply_retention, pending_archive_dates
 from focusledger.cli_support import ensure_initialized as _ensure_initialized
 from focusledger.server.app import create_server, serve_forever
 from focusledger.services.report import build_report_data, render_report_html
@@ -245,6 +245,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     cfg = ensure_initialized()
     with connect(cfg.database_path) as conn:
         heartbeat = latest_heartbeat(conn)
+        pending = pending_archive_dates(conn, cfg.raw_retention_days)
+    if pending:
+        print(
+            f"{len(pending)} day(s) of raw samples are past retention and not archived "
+            f"yet ({pending[0]} to {pending[-1]}); the agent archives them when it "
+            "starts, or run `focusledger db prune` now."
+        )
     if not heartbeat:
         print("No agent heartbeat recorded yet.")
         return

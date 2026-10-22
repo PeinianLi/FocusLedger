@@ -136,7 +136,12 @@ def _check_distraction(conn, config: AppConfig, tracker: DistractionTracker, sna
             tracker.reset()
             return
 
-        result = classify(snapshot.process_name, snapshot.window_title, load_rule_context(conn))
+        result = classify(
+            snapshot.process_name,
+            snapshot.window_title,
+            load_rule_context(conn),
+            executable_path=snapshot.executable_path,
+        )
         now = datetime.now().astimezone()
         fired = tracker.observe(result.category, config.poll_interval_seconds, now)
         if not fired:
