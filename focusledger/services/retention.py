@@ -8,6 +8,7 @@ from sqlite3 import Connection
 from focusledger.services.activity import (
     _derive_activity_segments,
     _derive_attention_segments,
+    _select_raw_events,
 )
 from focusledger.services.attention import (
     AttentionPolicy,
@@ -101,9 +102,11 @@ def apply_retention(
     # Fresh databases use incremental auto-vacuum. Existing databases still
     # reuse deleted pages and can be compacted once with the CLI maintenance
     # command if the physical file should shrink immediately.
+    # incremental_vacuum frees one page per step, so drain every row; a bare
+    # execute() steps once and releases a single page.
     auto_vacuum = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
     if auto_vacuum == 2:
-        conn.execute("PRAGMA incremental_vacuum")
+        conn.execute("PRAGMA incremental_vacuum").fetchall()
 
     return RetentionResult(
         archived_days=totals.archived_days,
@@ -117,10 +120,9 @@ def apply_retention(
 def _archive_dates(conn: Connection, keep_from_date: date) -> list[date]:
     rows = conn.execute(
         """
-        SELECT DISTINCT
-            COALESCE(local_date, substr(captured_at, 1, 10)) AS local_date
+        SELECT DISTINCT local_date
         FROM raw_activity_events
-        WHERE COALESCE(local_date, substr(captured_at, 1, 10)) < ?
+        WHERE local_date < ?
         ORDER BY local_date
         """,
         (keep_from_date.isoformat(),),
@@ -135,38 +137,12 @@ def _archive_day(
     poll_interval_seconds: int,
     attention_policy: AttentionPolicy,
 ) -> RetentionResult:
-    rows = [
-        dict(row)
-        for row in conn.execute(
-            """
-            SELECT
-                device_id,
-                captured_at,
-                captured_at_utc,
-                local_date,
-                timezone_id,
-                timezone_name,
-                utc_offset_seconds,
-                is_dst,
-                local_day_start_utc,
-                process_name,
-                executable_path,
-                window_title,
-                source,
-                idle_seconds
-            FROM raw_activity_events
-            WHERE local_date = ?
-               OR (
-                   local_date IS NULL
-                   AND substr(captured_at, 1, 10) = ?
-               )
-            ORDER BY
-                device_id,
-                COALESCE(captured_at_utc, captured_at)
-            """,
-            (local_date.isoformat(), local_date.isoformat()),
-        ).fetchall()
-    ]
+    rows = _select_raw_events(
+        conn,
+        "r.local_date = ?",
+        (local_date.isoformat(),),
+        "r.device_id, r.captured_at_utc",
+    )
     if not rows:
         return RetentionResult()
 
@@ -275,15 +251,8 @@ def _archive_day(
             ],
         )
         deleted = conn.execute(
-            """
-            DELETE FROM raw_activity_events
-            WHERE local_date = ?
-               OR (
-                   local_date IS NULL
-                   AND substr(captured_at, 1, 10) = ?
-               )
-            """,
-            (date_text, date_text),
+            "DELETE FROM raw_activity_events WHERE local_date = ?",
+            (date_text,),
         ).rowcount
         conn.commit()
     except Exception:

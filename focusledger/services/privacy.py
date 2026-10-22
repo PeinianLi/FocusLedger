@@ -125,10 +125,11 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
                     FROM activity_segments s
                     JOIN raw_activity_events r
                       ON r.device_id = s.device_id
-                     AND r.process_name IS s.process_name
-                     AND r.captured_at >= s.started_at
-                     AND r.captured_at <= s.ended_at
+                     AND r.captured_at_utc >= COALESCE(s.started_at_utc, s.started_at)
+                     AND r.captured_at_utc <= COALESCE(s.ended_at_utc, s.ended_at)
+                    LEFT JOIN applications a ON a.id = r.application_id
                     WHERE r.window_handle IN ({placeholders})
+                      AND a.process_name IS s.process_name
                       AND (s.window_title IS NULL OR s.window_title != ?)
                     """,
                     (*handles, PRIVATE_BROWSER_TITLE),
@@ -163,7 +164,11 @@ def redact_existing_private_browser_titles(conn: Connection) -> dict[str, int]:
 
 def _private_window_handles(conn: Connection) -> set[str]:
     rows = conn.execute(
-        "SELECT window_handle, process_name, window_title FROM raw_activity_events"
+        """
+        SELECT r.window_handle, a.process_name, r.window_title
+        FROM raw_activity_events r
+        LEFT JOIN applications a ON a.id = r.application_id
+        """
     ).fetchall()
     return {
         row["window_handle"]
@@ -177,9 +182,11 @@ def _private_window_handles(conn: Connection) -> set[str]:
 def _private_handleless_raw_ids(conn: Connection) -> list[str]:
     rows = conn.execute(
         """
-        SELECT id, process_name, window_title FROM raw_activity_events
-        WHERE window_handle IS NULL
-          AND (window_title IS NULL OR window_title != ?)
+        SELECT r.id, a.process_name, r.window_title
+        FROM raw_activity_events r
+        LEFT JOIN applications a ON a.id = r.application_id
+        WHERE r.window_handle IS NULL
+          AND (r.window_title IS NULL OR r.window_title != ?)
         """,
         (PRIVATE_BROWSER_TITLE,),
     ).fetchall()

@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from focusledger.agent.heartbeat import latest_heartbeat
+from focusledger.agent.heartbeat import heartbeat_stale_after, latest_heartbeat
 from focusledger.config import AppConfig
 from focusledger.db.connection import connect
 from focusledger.services.attention import AttentionPolicy
@@ -161,7 +161,7 @@ def _agent_status(conn, config: AppConfig) -> dict[str, object]:
         age = (datetime.now(timezone.utc) - moment).total_seconds()
     except ValueError:
         age = None
-    stale_after = max(config.poll_interval_seconds * 3, 30)
+    stale_after = heartbeat_stale_after(config.poll_interval_seconds)
     return {
         "status": str(heartbeat["status"]),
         "timestamp": timestamp,

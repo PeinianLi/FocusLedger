@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from importlib.resources import files
 from sqlite3 import Connection
 
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
+
+LOGGER = logging.getLogger(__name__)
 
 
 def apply_migrations(conn: Connection) -> None:
@@ -19,16 +22,16 @@ def apply_migrations(conn: Connection) -> None:
 
     schema = files("focusledger.db").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(schema)
+
+    legacy_raw = "captured_at" in _columns(conn, "raw_activity_events")
+    legacy_applications = "last_seen_at" in _columns(conn, "applications")
+    if legacy_raw:
+        _upgrade_legacy_raw_columns(conn)
+    if legacy_raw or legacy_applications:
+        _rebuild_raw_storage(conn, legacy_raw=legacy_raw)
+
     # Columns added after the first release: CREATE TABLE IF NOT EXISTS leaves
     # existing tables untouched, so add them explicitly for older databases.
-    _ensure_column(conn, "raw_activity_events", "idle_seconds", "REAL")
-    _ensure_column(conn, "raw_activity_events", "captured_at_utc", "TEXT")
-    _ensure_column(conn, "raw_activity_events", "local_date", "TEXT")
-    _ensure_column(conn, "raw_activity_events", "timezone_id", "TEXT")
-    _ensure_column(conn, "raw_activity_events", "timezone_name", "TEXT")
-    _ensure_column(conn, "raw_activity_events", "utc_offset_seconds", "INTEGER")
-    _ensure_column(conn, "raw_activity_events", "is_dst", "INTEGER")
-    _ensure_column(conn, "raw_activity_events", "local_day_start_utc", "TEXT")
     _ensure_column(conn, "activity_segments", "local_date", "TEXT")
     _ensure_column(conn, "activity_segments", "started_at_utc", "TEXT")
     _ensure_column(conn, "activity_segments", "ended_at_utc", "TEXT")
@@ -45,18 +48,6 @@ def apply_migrations(conn: Connection) -> None:
     _ensure_column(conn, "attention_segments", "utc_offset_seconds", "INTEGER")
     _ensure_column(conn, "attention_segments", "is_dst", "INTEGER")
     _ensure_column(conn, "attention_segments", "local_day_start_utc", "TEXT")
-    conn.execute(
-        """
-        UPDATE raw_activity_events
-        SET
-            local_date = COALESCE(local_date, substr(captured_at, 1, 10)),
-            captured_at_utc = COALESCE(
-                captured_at_utc,
-                strftime('%Y-%m-%dT%H:%M:%f+00:00', captured_at)
-            )
-        WHERE local_date IS NULL OR captured_at_utc IS NULL
-        """
-    )
     conn.execute(
         """
         UPDATE activity_segments
@@ -89,6 +80,12 @@ def apply_migrations(conn: Connection) -> None:
         ON raw_activity_events(local_date, captured_at_utc)
         """
     )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_identity
+        ON applications(process_name, executable_path)
+        """
+    )
     # Per-app attention is calculated by intersecting the two cooked segment
     # streams. Remove the redundant v6 summary table if it is present.
     conn.execute("DROP TABLE IF EXISTS daily_app_attention")
@@ -103,7 +100,189 @@ def apply_migrations(conn: Connection) -> None:
     conn.commit()
 
 
+def _upgrade_legacy_raw_columns(conn: Connection) -> None:
+    """Bring a pre-v9 raw table up to the v8 columns the v9 rebuild reads."""
+    _ensure_column(conn, "raw_activity_events", "idle_seconds", "REAL")
+    _ensure_column(conn, "raw_activity_events", "captured_at_utc", "TEXT")
+    _ensure_column(conn, "raw_activity_events", "local_date", "TEXT")
+    _ensure_column(conn, "raw_activity_events", "timezone_id", "TEXT")
+    _ensure_column(conn, "raw_activity_events", "timezone_name", "TEXT")
+    _ensure_column(conn, "raw_activity_events", "utc_offset_seconds", "INTEGER")
+    _ensure_column(conn, "raw_activity_events", "is_dst", "INTEGER")
+    _ensure_column(conn, "raw_activity_events", "local_day_start_utc", "TEXT")
+    conn.execute(
+        """
+        UPDATE raw_activity_events
+        SET
+            local_date = COALESCE(local_date, substr(captured_at, 1, 10)),
+            captured_at_utc = COALESCE(
+                captured_at_utc,
+                strftime('%Y-%m-%dT%H:%M:%f+00:00', captured_at)
+            )
+        WHERE local_date IS NULL OR captured_at_utc IS NULL
+        """
+    )
+    # v9 rebuilds the local capture time from UTC plus this offset, so derive
+    # it from the stored local timestamp for rows captured before v7.
+    conn.execute(
+        """
+        UPDATE raw_activity_events
+        SET utc_offset_seconds = CAST(round(
+            (julianday(substr(captured_at, 1, 19)) - julianday(captured_at_utc))
+            * 86400
+        ) AS INTEGER)
+        WHERE utc_offset_seconds IS NULL AND captured_at_utc IS NOT NULL
+        """
+    )
+    conn.commit()
+
+
+def _rebuild_raw_storage(conn: Connection, *, legacy_raw: bool) -> None:
+    """Move pre-v9 raw samples and applications into the v9 tables.
+
+    Runs as one transaction, so an interrupted upgrade leaves the old tables in
+    place and the next start simply tries again. Foreign keys are switched off
+    while the tables are swapped, as SQLite's table-rebuild procedure requires.
+    """
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            CREATE TABLE applications_v9 (
+                id INTEGER PRIMARY KEY,
+                process_name TEXT,
+                executable_path TEXT,
+                first_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO applications_v9(process_name, executable_path, first_seen_at)
+            SELECT process_name, executable_path, MIN(first_seen_at)
+            FROM applications
+            GROUP BY process_name, executable_path
+            """
+        )
+        moved = 0
+        if legacy_raw:
+            conn.execute(
+                """
+                INSERT INTO applications_v9(process_name, executable_path, first_seen_at)
+                SELECT seen.process_name, seen.executable_path, seen.first_seen_at
+                FROM (
+                    SELECT process_name, executable_path,
+                           MIN(captured_at_utc) AS first_seen_at
+                    FROM raw_activity_events
+                    WHERE process_name IS NOT NULL OR executable_path IS NOT NULL
+                    GROUP BY process_name, executable_path
+                ) AS seen
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM applications_v9 AS a
+                    WHERE a.process_name IS seen.process_name
+                      AND a.executable_path IS seen.executable_path
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO time_contexts(
+                    timezone_id, timezone_name, utc_offset_seconds, is_dst,
+                    local_day_start_utc
+                )
+                SELECT seen.timezone_id, seen.timezone_name,
+                       seen.utc_offset_seconds, seen.is_dst,
+                       seen.local_day_start_utc
+                FROM (
+                    SELECT DISTINCT timezone_id, timezone_name,
+                           utc_offset_seconds, is_dst, local_day_start_utc
+                    FROM raw_activity_events
+                ) AS seen
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM time_contexts AS t
+                    WHERE t.timezone_id IS seen.timezone_id
+                      AND t.timezone_name IS seen.timezone_name
+                      AND t.utc_offset_seconds IS seen.utc_offset_seconds
+                      AND t.is_dst IS seen.is_dst
+                      AND t.local_day_start_utc IS seen.local_day_start_utc
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE raw_activity_events_v9 (
+                    id INTEGER PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    captured_at_utc TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    time_context_id INTEGER REFERENCES time_contexts(id),
+                    process_id INTEGER,
+                    application_id INTEGER REFERENCES applications(id),
+                    window_title TEXT,
+                    window_handle TEXT,
+                    source TEXT NOT NULL,
+                    idle_seconds REAL
+                )
+                """
+            )
+            moved = conn.execute(
+                """
+                INSERT INTO raw_activity_events_v9(
+                    device_id, captured_at_utc, local_date, time_context_id,
+                    process_id, application_id, window_title, window_handle,
+                    source, idle_seconds
+                )
+                SELECT
+                    r.device_id,
+                    COALESCE(r.captured_at_utc, r.captured_at),
+                    COALESCE(r.local_date, substr(r.captured_at, 1, 10)),
+                    t.id,
+                    r.process_id,
+                    a.id,
+                    r.window_title,
+                    r.window_handle,
+                    r.source,
+                    r.idle_seconds
+                FROM raw_activity_events AS r
+                LEFT JOIN time_contexts AS t
+                  ON t.timezone_id IS r.timezone_id
+                 AND t.timezone_name IS r.timezone_name
+                 AND t.utc_offset_seconds IS r.utc_offset_seconds
+                 AND t.is_dst IS r.is_dst
+                 AND t.local_day_start_utc IS r.local_day_start_utc
+                LEFT JOIN applications_v9 AS a
+                  ON a.process_name IS r.process_name
+                 AND a.executable_path IS r.executable_path
+                ORDER BY COALESCE(r.captured_at_utc, r.captured_at)
+                """
+            ).rowcount
+            conn.execute("DROP TABLE raw_activity_events")
+            conn.execute(
+                "ALTER TABLE raw_activity_events_v9 RENAME TO raw_activity_events"
+            )
+        conn.execute("DROP TABLE applications")
+        conn.execute("ALTER TABLE applications_v9 RENAME TO applications")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+    LOGGER.info("rebuilt raw storage for schema v9: %s samples moved", moved)
+    # Fresh databases use incremental auto-vacuum, so hand the old table's
+    # pages back to the file system now instead of waiting for retention. The
+    # pragma frees one page per step, so every row has to be drained.
+    if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+        conn.execute("PRAGMA incremental_vacuum").fetchall()
+
+
+def _columns(conn: Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _ensure_column(conn: Connection, table: str, column: str, decl: str) -> None:
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    existing = _columns(conn, table)
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

@@ -17,12 +17,16 @@ from focusledger.services.attention import AttentionPolicy
 from focusledger.services.retention import apply_retention
 
 
-def snapshot(at: datetime, title: str) -> ActiveWindowSnapshot:
+def snapshot(
+    at: datetime,
+    title: str,
+    process_name: str = "Code.exe",
+) -> ActiveWindowSnapshot:
     return ActiveWindowSnapshot(
         captured_at=at,
         process_id=123,
-        process_name="Code.exe",
-        executable_path="C:\\Apps\\Code.exe",
+        process_name=process_name,
+        executable_path=f"C:\\Apps\\{process_name}",
         window_title=title,
         window_handle="1",
         source="test",
@@ -64,9 +68,9 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(result.raw_events_deleted, 2)
             self.assertEqual(result.heartbeats_deleted, 1)
             remaining_dates = [
-                row["captured_at"][:10]
+                row["local_date"]
                 for row in conn.execute(
-                    "SELECT captured_at FROM raw_activity_events"
+                    "SELECT local_date FROM raw_activity_events"
                 ).fetchall()
             ]
             self.assertEqual(remaining_dates, ["2026-07-18"])
@@ -141,19 +145,72 @@ class RetentionTests(unittest.TestCase):
             )
             conn.close()
 
+    def test_per_app_attention_is_unchanged_by_archiving(self) -> None:
+        # Code.exe sits untouched until input returns in chrome.exe, so the
+        # whole quiet stretch is confirmed hard_idle after the fact.
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect(Path(tmp) / "focusledger.sqlite3")
+            apply_migrations(conn)
+            policy = AttentionPolicy(
+                low_activity_after_seconds=2,
+                attention_gap_after_seconds=3,
+                interrupted_after_seconds=4,
+                hard_idle_after_seconds=5,
+            )
+            old = datetime(2026, 7, 17, 9, 0, tzinfo=timezone.utc)
+            for second in range(9):
+                self._insert_event(
+                    conn, old + timedelta(seconds=second), "Editor", float(second)
+                )
+            for second in range(9, 13):
+                self._insert_event(
+                    conn,
+                    old + timedelta(seconds=second),
+                    "Browser",
+                    0.0,
+                    process_name="chrome.exe",
+                )
+
+            before = summarize_attention(
+                conn, old.date(), poll_interval_seconds=1, attention_policy=policy
+            )
+            per_app = {row["process_name"]: row for row in before["per_app"]}
+            self.assertEqual(before["effective_seconds"], 3)
+            self.assertEqual(
+                sum(row["effective_seconds"] for row in before["per_app"]), 3
+            )
+            self.assertEqual(per_app["Code.exe"]["hard_idle"], 8)
+            self.assertEqual(per_app["Code.exe"]["effective_seconds"], 0)
+
+            apply_retention(
+                conn,
+                retention_days=7,
+                poll_interval_seconds=1,
+                attention_policy=policy,
+                now=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc),
+                local_timezone=timezone.utc,
+            )
+            after = summarize_attention(
+                conn, old.date(), poll_interval_seconds=1, attention_policy=policy
+            )
+
+            self.assertEqual(after["per_app"], before["per_app"])
+            conn.close()
+
     @staticmethod
     def _insert_event(
         conn,
         at: datetime,
         title: str,
         idle_seconds: float,
+        process_name: str = "Code.exe",
     ) -> None:
         from focusledger.services.activity import record_activity_snapshot
 
         record_activity_snapshot(
             conn,
             device_id="device_test",
-            snapshot=snapshot(at, title),
+            snapshot=snapshot(at, title, process_name),
             segment_gap_seconds=15,
             idle_seconds=idle_seconds,
         )

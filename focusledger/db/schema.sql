@@ -22,29 +22,36 @@ CREATE TABLE IF NOT EXISTS agent_heartbeats (
 CREATE INDEX IF NOT EXISTS idx_agent_heartbeats_timestamp
 ON agent_heartbeats(timestamp);
 
+-- One row per sample, written every poll, so the row stays narrow: the
+-- application and the time zone context repeat on nearly every sample and are
+-- stored once in lookup tables. Local capture time is rebuilt from UTC plus
+-- the context's offset. Indexes live in migrations.py because older databases
+-- still have the pre-v9 shape when this script runs.
 CREATE TABLE IF NOT EXISTS raw_activity_events (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     device_id TEXT NOT NULL,
-    captured_at TEXT NOT NULL,
-    captured_at_utc TEXT,
-    local_date TEXT,
+    captured_at_utc TEXT NOT NULL,
+    local_date TEXT NOT NULL,
+    time_context_id INTEGER REFERENCES time_contexts(id),
+    process_id INTEGER,
+    application_id INTEGER REFERENCES applications(id),
+    window_title TEXT,
+    window_handle TEXT,
+    source TEXT NOT NULL,
+    idle_seconds REAL
+);
+
+CREATE TABLE IF NOT EXISTS time_contexts (
+    id INTEGER PRIMARY KEY,
     timezone_id TEXT,
     timezone_name TEXT,
     utc_offset_seconds INTEGER,
     is_dst INTEGER,
-    local_day_start_utc TEXT,
-    process_id INTEGER,
-    process_name TEXT,
-    executable_path TEXT,
-    window_title TEXT,
-    window_handle TEXT,
-    source TEXT NOT NULL,
-    idle_seconds REAL,
-    created_at TEXT NOT NULL
+    local_day_start_utc TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_raw_activity_events_captured_at
-ON raw_activity_events(captured_at);
+CREATE INDEX IF NOT EXISTS idx_time_contexts_day_start
+ON time_contexts(local_day_start_utc);
 
 CREATE TABLE IF NOT EXISTS activity_segments (
     id TEXT PRIMARY KEY,
@@ -91,12 +98,10 @@ CREATE TABLE IF NOT EXISTS attention_segments (
 );
 
 CREATE TABLE IF NOT EXISTS applications (
-    id TEXT PRIMARY KEY,
-    process_name TEXT NOT NULL,
+    id INTEGER PRIMARY KEY,
+    process_name TEXT,
     executable_path TEXT,
-    first_seen_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    UNIQUE(process_name, executable_path)
+    first_seen_at TEXT NOT NULL
 );
 
 -- ---------------------------------------------------------------------------

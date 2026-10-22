@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from sqlite3 import Connection
 
@@ -13,7 +12,7 @@ from focusledger.services.attention import (
     classify_attention,
 )
 from focusledger.services.privacy import sanitize_snapshot
-from focusledger.time_context import capture_time_context
+from focusledger.time_context import CapturedTimeContext, capture_time_context
 
 
 DEFAULT_SEGMENT_GAP_SECONDS = 15
@@ -30,53 +29,92 @@ def record_activity_snapshot(
 ) -> None:
     snapshot = sanitize_snapshot(snapshot)
     time_context = capture_time_context(snapshot.captured_at)
-    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO raw_activity_events(
-            id, device_id, captured_at, captured_at_utc, local_date,
-            timezone_id, timezone_name, utc_offset_seconds, is_dst,
-            local_day_start_utc, process_id, process_name, executable_path,
-            window_title, window_handle, source, idle_seconds, created_at
+            device_id, captured_at_utc, local_date, time_context_id,
+            process_id, application_id, window_title, window_handle, source,
+            idle_seconds
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            uuid.uuid4().hex,
             device_id,
-            time_context.captured_at,
             time_context.captured_at_utc,
             time_context.local_date,
-            time_context.timezone_id,
-            time_context.timezone_name,
-            time_context.utc_offset_seconds,
-            int(time_context.is_dst),
-            time_context.local_day_start_utc,
+            _time_context_id(conn, time_context),
             snapshot.process_id,
-            snapshot.process_name,
-            snapshot.executable_path,
+            _application_id(conn, snapshot),
             snapshot.window_title,
             snapshot.window_handle,
             snapshot.source,
             idle_seconds,
-            now,
         ),
     )
-    _upsert_application(conn, snapshot, now)
     conn.commit()
 
 
-def _upsert_application(conn: Connection, snapshot: ActiveWindowSnapshot, now: str) -> None:
-    if not snapshot.process_name:
-        return
-    conn.execute(
+def _application_id(conn: Connection, snapshot: ActiveWindowSnapshot) -> int | None:
+    """Look up the sample's application, inserting it the first time it is seen."""
+    if snapshot.process_name is None and snapshot.executable_path is None:
+        return None
+    row = conn.execute(
         """
-        INSERT INTO applications(id, process_name, executable_path, first_seen_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(process_name, executable_path)
-        DO UPDATE SET last_seen_at = excluded.last_seen_at
+        SELECT id FROM applications
+        WHERE process_name IS ? AND executable_path IS ?
         """,
-        (uuid.uuid4().hex, snapshot.process_name, snapshot.executable_path, now, now),
+        (snapshot.process_name, snapshot.executable_path),
+    ).fetchone()
+    if row:
+        return int(row[0])
+    return int(
+        conn.execute(
+            """
+            INSERT INTO applications(process_name, executable_path, first_seen_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                snapshot.process_name,
+                snapshot.executable_path,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        ).lastrowid
+    )
+
+
+def _time_context_id(conn: Connection, context: CapturedTimeContext) -> int:
+    """Look up the sample's time zone context; a new one appears about daily."""
+    values = (
+        context.timezone_id,
+        context.timezone_name,
+        context.utc_offset_seconds,
+        int(context.is_dst),
+        context.local_day_start_utc,
+    )
+    row = conn.execute(
+        """
+        SELECT id FROM time_contexts
+        WHERE local_day_start_utc IS ?
+          AND timezone_id IS ?
+          AND timezone_name IS ?
+          AND utc_offset_seconds IS ?
+          AND is_dst IS ?
+        """,
+        (values[4], *values[:4]),
+    ).fetchone()
+    if row:
+        return int(row[0])
+    return int(
+        conn.execute(
+            """
+            INSERT INTO time_contexts(
+                timezone_id, timezone_name, utc_offset_seconds, is_dst,
+                local_day_start_utc
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            values,
+        ).lastrowid
     )
 
 
@@ -133,14 +171,15 @@ def summarize_attention(
     policy = attention_policy or AttentionPolicy()
     all_states = (*ATTENTION_STATES, UNKNOWN)
     totals = {state: 0.0 for state in all_states}
-    per_app: dict[str, dict[str, float]] = {}
     effective_seconds = 0.0
 
     raw_rows = _list_raw_activity_events(conn, day)
     if raw_rows:
         attention_segments = _derive_attention_segments(raw_rows, policy)
+        activity_segments = _derive_activity_segments(raw_rows)
     else:
         attention_segments = _list_archived_attention_segments(conn, day)
+        activity_segments = _list_archived_activity_segments(conn, day)
     for segment in attention_segments:
         state = str(segment["attention_state"])
         seconds = float(segment["duration_seconds"] or 0.0)
@@ -148,39 +187,11 @@ def summarize_attention(
         totals[state] += seconds
         effective_seconds += seconds * state_weight
 
-    if raw_rows:
-        weight = float(poll_interval_seconds)
-        # Raw dates keep sample-level application ownership.
-        for row in raw_rows:
-            name = row["process_name"] or "(unknown)"
-            result = classify_attention(row["idle_seconds"], policy)
-            state = result.state
-            state_weight = result.weight
-
-            bucket = per_app.setdefault(
-                name,
-                {
-                    **{state_name: 0.0 for state_name in all_states},
-                    "raw_seconds": 0.0,
-                    "effective_seconds": 0.0,
-                },
-            )
-            bucket[state] += weight
-            bucket["raw_seconds"] += weight
-            bucket["effective_seconds"] += weight * state_weight
-
-        per_app_rows = [
-            {
-                "process_name": name,
-                **values,
-            }
-            for name, values in per_app.items()
-        ]
-    else:
-        per_app_rows = _summarize_archived_attention_by_app(
-            _list_archived_activity_segments(conn, day),
-            attention_segments,
-        )
+    # Raw and archived dates attribute attention to apps the same way. Scoring
+    # each raw sample by its own idle value would skip the retroactive
+    # hard_idle rule, so per-app totals could exceed the day total and then
+    # drop once retention archived the day.
+    per_app_rows = _summarize_attention_by_app(activity_segments, attention_segments)
     per_app_rows.sort(
         key=lambda row: row["raw_seconds"],
         reverse=True,
@@ -195,31 +206,58 @@ def summarize_attention(
 
 
 def _list_raw_activity_events(conn: Connection, day: date) -> list[dict[str, object]]:
+    return _select_raw_events(
+        conn,
+        "r.local_date = ?",
+        (day.isoformat(),),
+        "r.captured_at_utc",
+    )
+
+
+def _select_raw_events(
+    conn: Connection,
+    where: str,
+    params: tuple[object, ...],
+    order_by: str,
+) -> list[dict[str, object]]:
+    """Raw samples with their lookups joined back in, one dict per sample."""
     rows = conn.execute(
-        """
+        f"""
         SELECT
-            device_id,
-            captured_at,
-            captured_at_utc,
-            local_date,
-            timezone_id,
-            timezone_name,
-            utc_offset_seconds,
-            is_dst,
-            local_day_start_utc,
-            process_name,
-            executable_path,
-            window_title,
-            source,
-            idle_seconds
-        FROM raw_activity_events
-        WHERE local_date = ?
-           OR (local_date IS NULL AND substr(captured_at, 1, 10) = ?)
-        ORDER BY COALESCE(captured_at_utc, captured_at) ASC
+            r.id,
+            r.device_id,
+            r.captured_at_utc,
+            r.local_date,
+            t.timezone_id,
+            t.timezone_name,
+            t.utc_offset_seconds,
+            t.is_dst,
+            t.local_day_start_utc,
+            a.process_name,
+            a.executable_path,
+            r.window_title,
+            r.window_handle,
+            r.source,
+            r.idle_seconds
+        FROM raw_activity_events AS r
+        LEFT JOIN time_contexts AS t ON t.id = r.time_context_id
+        LEFT JOIN applications AS a ON a.id = r.application_id
+        WHERE {where}
+        ORDER BY {order_by}
         """,
-        (day.isoformat(), day.isoformat()),
+        params,
     ).fetchall()
-    return [dict(row) for row in rows]
+    return [_with_local_capture_time(dict(row)) for row in rows]
+
+
+def _with_local_capture_time(row: dict[str, object]) -> dict[str, object]:
+    """Rebuild the local capture timestamp from UTC and the stored offset."""
+    moment = datetime.fromisoformat(str(row["captured_at_utc"]))
+    offset = row.get("utc_offset_seconds")
+    if offset is not None:
+        moment = moment.astimezone(timezone(timedelta(seconds=int(offset))))
+    row["captured_at"] = moment.isoformat()
+    return row
 
 
 def _list_archived_activity_segments(
@@ -284,11 +322,11 @@ def _list_archived_attention_segments(
     return [dict(row) for row in rows]
 
 
-def _summarize_archived_attention_by_app(
+def _summarize_attention_by_app(
     activity_segments: list[dict[str, object]],
     attention_segments: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Calculate per-app attention from the two cooked segment streams."""
+    """Calculate per-app attention by intersecting the two segment streams."""
     all_states = (*ATTENTION_STATES, UNKNOWN)
     activity_by_device: dict[str, list[dict[str, object]]] = {}
     for segment in activity_segments:

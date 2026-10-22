@@ -5,7 +5,7 @@ import time
 from datetime import date, datetime, timezone, tzinfo
 from dataclasses import dataclass
 
-from focusledger.agent.heartbeat import write_heartbeat
+from focusledger.agent.heartbeat import HeartbeatThrottle, write_heartbeat
 from focusledger.config import AppConfig
 from focusledger.db.connection import connect
 from focusledger.platform import get_platform_adapter
@@ -42,9 +42,11 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
         cooldown_seconds=config.notification_cooldown_seconds,
     )
 
+    heartbeats = HeartbeatThrottle()
+
     with connect(config.database_path) as conn:
         set_setting(conn, "agent_stop_requested", "false")
-        write_heartbeat(conn, device_id=config.device_id, message="agent started")
+        heartbeats.beat(conn, device_id=config.device_id, message="agent started")
         last_retention_date: date | None = None
         next_retention_attempt = 0.0
 
@@ -95,11 +97,11 @@ def run_agent(config: AppConfig, options: AgentRunOptions) -> None:
                     idle_seconds=idle_seconds,
                     attention_policy=attention_policy,
                 )
-                write_heartbeat(conn, device_id=config.device_id)
+                heartbeats.beat(conn, device_id=config.device_id)
                 _check_distraction(conn, config, tracker, snapshot)
             except Exception as exc:
                 LOGGER.exception("agent sample failed")
-                write_heartbeat(conn, device_id=config.device_id, status="error", message=str(exc))
+                heartbeats.beat(conn, device_id=config.device_id, status="error", message=str(exc))
 
             sample_count += 1
             if options.once or (options.max_samples is not None and sample_count >= options.max_samples):

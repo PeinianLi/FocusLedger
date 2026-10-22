@@ -122,19 +122,24 @@ class HandlelessPrivacyRedactionTests(unittest.TestCase):
     def insert_event(self, conn, event_id: str, title: str, handle: str | None) -> None:
         conn.execute(
             """
+            INSERT OR IGNORE INTO applications(process_name, executable_path, first_seen_at)
+            VALUES ('Google Chrome', '/Applications/Google Chrome.app', '2026-07-17T09:00:00+00:00')
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO raw_activity_events(
-                id, device_id, captured_at, process_id, process_name,
-                executable_path, window_title, window_handle, source, created_at
+                device_id, captured_at_utc, local_date, process_id,
+                application_id, window_title, window_handle, source
             )
-            VALUES (?, 'device_test', ?, 501, 'Google Chrome',
-                    '/Applications/Google Chrome.app', ?, ?, 'macos_active_window', ?)
+            VALUES ('device_test', ?, '2026-07-17', 501,
+                    (SELECT id FROM applications WHERE process_name = 'Google Chrome'),
+                    ?, ?, 'macos_active_window')
             """,
             (
-                event_id,
                 f"2026-07-17T09:00:0{event_id[-1]}+00:00",
                 title,
                 handle,
-                "2026-07-17T09:00:00+00:00",
             ),
         )
         conn.commit()
@@ -143,7 +148,7 @@ class HandlelessPrivacyRedactionTests(unittest.TestCase):
         return [
             row["window_title"]
             for row in conn.execute(
-                "SELECT window_title FROM raw_activity_events ORDER BY captured_at"
+                "SELECT window_title FROM raw_activity_events ORDER BY captured_at_utc"
             ).fetchall()
         ]
 

@@ -1,6 +1,6 @@
 # FocusLedger
 
-FocusLedger 是一个本地优先的个人生产力审计工具。当前版本完成了提案 Phase 0-9 的 MVP：本地采集、attention 估算、workday 模型、活动分类、deliverable 追踪、分心提醒、本地 LLM 日报、开机自启，以及一个实时的浏览器仪表台。合并后的 schema v8 使用 raw/cooked 两层存储，在保留长期时间线的同时控制数据库增长。所有数据只存在本机 SQLite，不上传任何服务器。
+FocusLedger 是一个本地优先的个人生产力审计工具。当前版本完成了提案 Phase 0-9 的 MVP：本地采集、attention 估算、workday 模型、活动分类、deliverable 追踪、分心提醒、本地 LLM 日报、开机自启，以及一个实时的浏览器仪表台。schema v9 使用 raw/cooked 两层存储，在保留长期时间线的同时控制数据库增长。所有数据只存在本机 SQLite，不上传任何服务器。
 
 ## 文档入口
 
@@ -26,11 +26,11 @@ README 只保留项目级说明；具体命令、日常操作和排查步骤统�
 -> report 命令起本地服务，浏览器实时查看可交互仪表台
 ```
 
-## Schema v8 与数据保留
+## Schema v9 与数据保留
 
 数据库按用途分为三组：
 
-- **raw data**：`raw_activity_events` 和 `agent_heartbeats`。默认保留最近 7 个系统本地日期，保留天数可配置。
+- **raw data**：`raw_activity_events` 和 `agent_heartbeats`。默认保留最近 7 个系统本地日期，保留天数可配置。采样每次一行，应用和时区信息只在 `applications`、`time_contexts` 查找表里存一份；心跳只在状态变化时或每 30 秒写一次。
 - **cooked data**：`activity_segments` 和 `attention_segments`。raw data 到期前按完整日期归档，长期保存。
 - **用户事实与功能状态**：workday session/pause、classification rule/correction、deliverable/task/note、distraction、daily review 等 Phase 3-9 表。
 
@@ -43,7 +43,9 @@ missing data intervals   deliverable 时间归因
 
 最近 raw data 可以按新的 attention 阈值重新解释；已经归档的 cooked data 保留归档当时生成的时间段。活动分类、per-app 汇总和 deliverable 归因仍会按当前规则从 raw 或 cooked data 计算。
 
-每条新采样同时保存本地时间、UTC、系统时区 ID、时区显示名、UTC offset、DST 状态和本地午夜对应的 UTC。排序和持续时间使用 UTC，避免切换时区或夏令时回拨造成时间线逆序、截断。
+每条新采样保存 UTC 时间，并关联一条时区上下文（系统时区 ID、时区显示名、UTC offset、DST 状态和本地午夜对应的 UTC），本地时间由 UTC 加 offset 还原。排序和持续时间使用 UTC，避免切换时区或夏令时回拨造成时间线逆序、截断。
+
+从 v8 升级时，第一次运行任意命令会把 raw 表就地重建为 v9 结构（一个事务完成，失败会整体回滚）。
 
 常用维护命令：
 

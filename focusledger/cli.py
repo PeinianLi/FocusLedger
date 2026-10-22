@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from focusledger.agent.heartbeat import latest_heartbeat
+from focusledger.agent.heartbeat import heartbeat_stale_after, latest_heartbeat
 from focusledger.agent.runner import (
     AgentRunOptions,
     mark_agent_stopped,
@@ -252,7 +252,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  status: {heartbeat['status']}")
     print(f"  timestamp: {heartbeat['timestamp']}")
     age_seconds = heartbeat_age_seconds(str(heartbeat["timestamp"]))
-    stale_after = max(cfg.poll_interval_seconds * 3, 30)
+    stale_after = heartbeat_stale_after(cfg.poll_interval_seconds)
     print(f"  age_seconds: {age_seconds:.1f}")
     if heartbeat["status"] == "running" and age_seconds > stale_after:
         print(f"  stale: true (no heartbeat within {stale_after}s)")
@@ -299,7 +299,7 @@ def cmd_db_compact(args: argparse.Namespace) -> None:
         heartbeat = latest_heartbeat(conn)
         if heartbeat and heartbeat["status"] == "running":
             age_seconds = heartbeat_age_seconds(str(heartbeat["timestamp"]))
-            stale_after = max(cfg.poll_interval_seconds * 3, 30)
+            stale_after = heartbeat_stale_after(cfg.poll_interval_seconds)
             if age_seconds <= stale_after:
                 raise SystemExit(
                     "agent is still running; stop it before compacting the database"

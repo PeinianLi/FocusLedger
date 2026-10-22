@@ -211,7 +211,7 @@ class ActivitySegmentTests(unittest.TestCase):
 
             raw_titles = [
                 row["window_title"]
-                for row in conn.execute("SELECT window_title FROM raw_activity_events ORDER BY captured_at").fetchall()
+                for row in conn.execute("SELECT window_title FROM raw_activity_events ORDER BY captured_at_utc").fetchall()
             ]
             segments = list_timeline(conn, base.date())
             self.assertEqual(raw_titles, [PRIVATE_BROWSER_TITLE, PRIVATE_BROWSER_TITLE])
@@ -452,17 +452,25 @@ class ActivitySegmentTests(unittest.TestCase):
             conn = open_db(Path(tmp) / "focusledger.sqlite3")
             base = datetime(2026, 6, 8, 9, 0, tzinfo=timezone.utc)
             later = base + timedelta(seconds=5)
+            application_id = conn.execute(
+                """
+                INSERT INTO applications(process_name, executable_path, first_seen_at)
+                VALUES ('chrome.exe', 'chrome.exe', ?)
+                """,
+                (base.isoformat(),),
+            ).lastrowid
             conn.execute(
                 """
                 INSERT INTO raw_activity_events(
-                    id, device_id, captured_at, process_id, process_name, executable_path,
-                    window_title, window_handle, source, created_at
+                    device_id, captured_at_utc, local_date, process_id, application_id,
+                    window_title, window_handle, source
                 )
-                VALUES ('raw1', 'device_test', ?, 1, 'chrome.exe', 'chrome.exe', 'New Incognito Tab', 'private1', 'test', ?)
+                VALUES ('device_test', ?, ?, 1, ?, 'New Incognito Tab', 'private1', 'test')
                 """,
                 (
                     base.isoformat(),
-                    base.isoformat(),
+                    base.date().isoformat(),
+                    application_id,
                 ),
             )
             conn.execute(

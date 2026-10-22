@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from sqlite3 import Connection
 
+from focusledger.agent.heartbeat import heartbeat_stale_after
 from focusledger.timeutil import align, parse_aligned
 from focusledger.time_context import capture_time_context
 
@@ -333,11 +334,11 @@ def missing_data_intervals(
     """Stretches inside a window where the agent was not reporting.
 
     Derived from heartbeat gaps, so a crashed or stopped agent shows up in the
-    review instead of silently looking like idle time. A gap has to exceed
-    three poll intervals (and at least a minute) before it counts, so ordinary
-    scheduling jitter does not register.
+    review instead of silently looking like idle time. A gap has to exceed the
+    heartbeat staleness window before it counts, so the agent's normal
+    heartbeat interval and scheduling jitter do not register.
     """
-    tolerance = max(config.poll_interval_seconds * 3, 60)
+    tolerance = heartbeat_stale_after(config.poll_interval_seconds)
     rows = conn.execute(
         "SELECT timestamp FROM agent_heartbeats WHERE timestamp >= ? AND timestamp <= ? "
         "ORDER BY timestamp",
