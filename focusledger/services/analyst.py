@@ -14,16 +14,20 @@ import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import time as day_time
 from sqlite3 import Connection
 from typing import Callable
 
 from focusledger.services import llm as llm_service
 from focusledger.services import workday as workday_service
-from focusledger.services.activity import day_segments
+from focusledger.services.activity import absences_between, day_segments
 from focusledger.services.alerts import list_distractions
 from focusledger.services.attention import AttentionPolicy
+from focusledger.services.changes import ABSENCE_LABELS, Proposal
 from focusledger.services.classify import (
+    CATEGORIES,
+    SCOPES,
     UNKNOWN,
     attach_attention_weight,
     classify_segments,
@@ -39,6 +43,7 @@ DEFAULT_NUM_CTX = 16384
 # How often an answer is sent back: for skipping the tools, or for numbers no
 # tool returned. Small models do both; one pointed retry usually fixes it.
 MAX_CORRECTIONS = 2
+MAX_HISTORY_TURNS = 4
 
 _NO_TOOLS_CORRECTION = (
     "You answered without calling any tool, so none of that comes from the user's "
@@ -95,6 +100,19 @@ class DayFacts:
         return totals
 
 
+def tracked_dates(conn: Connection) -> list[str]:
+    """Every local date with recorded activity, raw or archived, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT local_date FROM activity_segments
+        UNION
+        SELECT local_date FROM raw_activity_events
+        ORDER BY 1
+        """
+    ).fetchall()
+    return [str(row[0]) for row in rows if row[0]]
+
+
 class Ledger:
     """Tracked data for one analysis run; each day is computed at most once."""
 
@@ -105,18 +123,12 @@ class Ledger:
         self._rules = load_rule_context(conn)
         self._days: dict[str, DayFacts] = {}
         self._dates: list[str] | None = None
+        # Changes the model proposed in this run; none is written until approved.
+        self.proposals: list[Proposal] = []
 
     def tracked_dates(self) -> list[str]:
         if self._dates is None:
-            rows = self.conn.execute(
-                """
-                SELECT local_date FROM activity_segments
-                UNION
-                SELECT local_date FROM raw_activity_events
-                ORDER BY 1
-                """
-            ).fetchall()
-            self._dates = [str(row[0]) for row in rows if row[0]]
+            self._dates = tracked_dates(self.conn)
         return self._dates
 
     def dates_between(self, start: str, end: str) -> list[str]:
@@ -263,6 +275,15 @@ def tool_day_summary(ledger: Ledger, args: dict[str, object]) -> dict[str, objec
     alerts = list_distractions(ledger.conn, day)
     if alerts:
         result["distraction_alerts"] = len(alerts)
+    span = _day_span(facts)
+    if span:
+        marked = absences_between(ledger.conn, span[0], span[1])
+        if marked:
+            result["marked_absent"] = [
+                {"start": _clock(start.astimezone(span[2]).isoformat()),
+                 "end": _clock(end.astimezone(span[2]).isoformat()), "label": label}
+                for start, end, label in marked[:20]
+            ]
     return result
 
 
@@ -503,6 +524,89 @@ def tool_deliverables(ledger: Ledger, args: dict[str, object]) -> dict[str, obje
     }
 
 
+_AWAITING = (
+    "Nothing has changed yet. Tell the user exactly what this would change, using "
+    "the preview figures, and that it needs their approval."
+)
+
+
+def tool_mark_absent(ledger: Ledger, args: dict[str, object]) -> dict[str, object]:
+    day = _tracked_date(ledger, args, "date")
+    label = str(args.get("label") or "").strip().lower()
+    if label not in ABSENCE_LABELS:
+        raise ToolError(f"label must be one of: {', '.join(ABSENCE_LABELS)}")
+    facts = ledger.day(day)
+    app = str(args.get("app") or "").strip()
+    if app:
+        ranges = _app_ranges(facts, app)
+        if not ranges:
+            names = [name for name, _ in _top(facts.totals_by("process_name"), 10)]
+            raise ToolError(f"'{app}' was never in front on {day}; apps that day: {', '.join(names)}")
+        what = f"every stretch when {app} was in front"
+    else:
+        ranges = [_clock_range(facts, day, args)]
+        what = f"{_clock(ranges[0][0].isoformat())}-{_clock(ranges[0][1].isoformat())}"
+    preview = _absence_preview(facts, ranges)
+    proposal = Proposal(
+        action="mark_absent",
+        arguments={
+            "date": day,
+            "label": label,
+            "app": app or None,
+            "note": str(args.get("note") or "") or None,
+            "ranges": [[s.astimezone(timezone.utc).isoformat(), e.astimezone(timezone.utc).isoformat()]
+                       for s, e in ranges],
+        },
+        summary=f"Mark {what} on {day} as {label} ({preview['marked_hours']} h)",
+        preview=preview,
+    )
+    ledger.proposals.append(proposal)
+    return {"status": "awaiting_user_approval", "proposal_id": proposal.id,
+            "summary": proposal.summary, "preview": preview, "note": _AWAITING}
+
+
+def tool_correct_category(ledger: Ledger, args: dict[str, object]) -> dict[str, object]:
+    scope = str(args.get("scope") or "").strip()
+    pattern = str(args.get("pattern") or "").strip().lower()
+    category = str(args.get("category") or "").strip()
+    if scope not in SCOPES:
+        raise ToolError(f"scope must be one of: {', '.join(SCOPES)}")
+    if not pattern:
+        raise ToolError("pattern is required, e.g. 'explorer.exe' or 'youtube.com'")
+    if category not in CATEGORIES:
+        raise ToolError(f"category must be one of: {', '.join(CATEGORIES)}")
+    current = ledger._rules.get("corrections", {}).get(scope, {}).get(pattern)  # type: ignore[union-attr]
+
+    recent = ledger.tracked_dates()[-7:]
+    hours: Counter = Counter()
+    for day in recent:
+        for segment in ledger.day(day).activity:
+            if _matches_scope(segment, scope, pattern):
+                hours[str(segment.get("category"))] += _seconds(segment)
+    preview = {
+        "scope": scope,
+        "pattern": pattern,
+        "new_category": category,
+        "replaces_correction": current,
+        "last_7_tracked_days": {
+            "start": recent[0] if recent else None,
+            "end": recent[-1] if recent else None,
+            "matching_hours": _h(sum(hours.values())),
+            "current_categories": {name: _h(sec) for name, sec in hours.most_common()},
+        },
+    }
+    proposal = Proposal(
+        action="correct_category",
+        arguments={"scope": scope, "pattern": pattern, "category": category},
+        summary=f"Always classify {scope} '{pattern}' as {category}"
+                + (f" (replacing {current})" if current else ""),
+        preview=preview,
+    )
+    ledger.proposals.append(proposal)
+    return {"status": "awaiting_user_approval", "proposal_id": proposal.id,
+            "summary": proposal.summary, "preview": preview, "note": _AWAITING}
+
+
 _DATE = "Local date, YYYY-MM-DD."
 TOOLS: tuple[Tool, ...] = (
     Tool(
@@ -575,7 +679,41 @@ TOOLS: tuple[Tool, ...] = (
         _params(start=_DATE, end=_DATE),
         tool_deliverables,
     ),
+    Tool(
+        "mark_absent",
+        "PROPOSE marking time on one day as time the user was away from the computer "
+        f"(label: {', '.join(ABSENCE_LABELS)}). Marked time counts as idle with no "
+        "effective attention. Give either app (e.g. '(unknown)' for the lock screen) to "
+        "mark every stretch that app was in front, or start_time and end_time (HH:MM; an "
+        "end before the start runs past midnight). When the user names an app, pass app "
+        "rather than clock times read off the timeline, so no stretch is missed. "
+        "Nothing is written until the user approves.",
+        _params(
+            ("date", "label"),
+            date=_DATE,
+            label=f"One of {', '.join(ABSENCE_LABELS)}; use the word the user said "
+            "(离线 offline, 睡觉 sleep, 外出 away, 吃饭 meal, 休息 break).",
+            app="Optional: mark every stretch this app was in front.",
+            start_time="Optional start, HH:MM (use with end_time).",
+            end_time="Optional end, HH:MM.",
+            note="Optional short note from the user.",
+        ),
+        tool_mark_absent,
+    ),
+    Tool(
+        "correct_category",
+        "PROPOSE always classifying an app (scope 'process', e.g. 'explorer.exe'), a "
+        "site (scope 'site', e.g. 'youtube.com') or a title keyword (scope "
+        f"'title_keyword') as a category ({', '.join(c for c in CATEGORIES if c != UNKNOWN)}). "
+        "Re-explains all history. Nothing is written until the user approves.",
+        _params(("scope", "pattern", "category"),
+                scope="process, site or title_keyword.",
+                pattern="The app name, site or keyword.",
+                category="The category to use."),
+        tool_correct_category,
+    ),
 )
+WRITE_TOOLS = frozenset({"mark_absent", "correct_category"})
 TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 
 
@@ -612,6 +750,8 @@ class AnalysisResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     ungrounded_numbers: list[str] = field(default_factory=list)
     corrections: list[str] = field(default_factory=list)
+    thinking: list[str] = field(default_factory=list)
+    proposals: list[Proposal] = field(default_factory=list)
     prompt_tokens: int = 0
     output_tokens: int = 0
 
@@ -631,6 +771,8 @@ class AnalysisResult:
             ],
             "ungrounded_numbers": self.ungrounded_numbers,
             "corrections": self.corrections,
+            "thinking": self.thinking,
+            "proposals": [p.to_json_dict() for p in self.proposals],
             "prompt_tokens": self.prompt_tokens,
             "output_tokens": self.output_tokens,
         }
@@ -651,12 +793,18 @@ def analyze(
     num_ctx: int = DEFAULT_NUM_CTX,
     timeout: float | None = None,
     tool_mode: str = "auto",
+    history: list[dict[str, str]] | None = None,
     on_tool_call: Callable[[ToolCall], None] | None = None,
+    on_thinking: Callable[[str], None] | None = None,
+    on_proposal: Callable[[Proposal], None] | None = None,
 ) -> AnalysisResult:
     """Let the local model answer ``question`` by calling the tools above.
 
     ``tool_mode`` is "native" (Ollama's tool-calling API), "text" (the model
     writes a JSON call into its reply) or "auto", which picks per model.
+    ``history`` holds earlier ``{"question", "answer"}`` turns of the same
+    conversation, so a follow-up such as "mark that day" can be resolved.
+    Write tools only add proposals to the result; nothing is written here.
     Raises ``llm_service.LlmUnavailable`` when the model cannot be used.
     """
     model = model or analyst_model(config)
@@ -666,10 +814,12 @@ def analyze(
     system = _system_prompt(ledger, config)
     if mode == "text":
         system += "\n\n" + _text_protocol()
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": question},
-    ]
+    earlier = [turn for turn in (history or []) if turn.get("question") and turn.get("answer")]
+    messages: list[dict[str, object]] = [{"role": "system", "content": system}]
+    for turn in earlier[-MAX_HISTORY_TURNS:]:
+        messages.append({"role": "user", "content": str(turn["question"])})
+        messages.append({"role": "assistant", "content": str(turn["answer"])})
+    messages.append({"role": "user", "content": question})
     schemas = [tool.schema() for tool in TOOLS]
     result = AnalysisResult(question, model, "", "no_answer", 0, 0.0, tool_mode=mode)
     seen: dict[str, dict[str, object]] = {}
@@ -684,10 +834,24 @@ def analyze(
         result.rounds += 1
         result.prompt_tokens += int(reply.get("prompt_eval_count") or 0)
         result.output_tokens += int(reply.get("eval_count") or 0)
-        return reply["message"]  # type: ignore[return-value]
+        message: dict[str, object] = reply["message"]  # type: ignore[assignment]
+        # Thinking arrives in its own field, or inside <think> in older templates.
+        thought = "\n".join(
+            part.strip()
+            for part in [str(message.get("thinking") or ""),
+                         *re.findall(r"<think>(.*?)</think>", str(message.get("content") or ""), re.DOTALL)]
+            if part.strip()
+        )
+        if thought:
+            result.thinking.append(thought)
+            if on_thinking:
+                on_thinking(thought)
+        return message
 
     def sources() -> list[str]:
-        return [system, question] + [json.dumps(c.result) for c in result.tool_calls]
+        return ([system, question]
+                + [f"{t['question']}\n{t['answer']}" for t in earlier]
+                + [json.dumps(c.result) for c in result.tool_calls])
 
     for _ in range(max_rounds):
         message = ask(with_tools=True)
@@ -724,8 +888,14 @@ def analyze(
         for name, arguments in calls:
             key = json.dumps([name, arguments], sort_keys=True)
             tool_started = time.perf_counter()
-            output = seen.get(key) or run_tool(ledger, name, arguments)
+            proposed = len(ledger.proposals)
+            # A repeated read is served from cache; a repeated write proposal is not.
+            output = (seen.get(key) if name not in WRITE_TOOLS else None) or run_tool(ledger, name, arguments)
             seen[key] = output
+            for proposal in ledger.proposals[proposed:]:
+                result.proposals.append(proposal)
+                if on_proposal:
+                    on_proposal(proposal)
             record = ToolCall(name, arguments, time.perf_counter() - tool_started, output)
             result.tool_calls.append(record)
             if on_tool_call:
@@ -869,6 +1039,13 @@ def _system_prompt(ledger: Ledger, config) -> str:
         "closest tracked period, naming its dates.",
         "5. Lead with the direct answer, then 2-5 concrete supporting points. No "
         "praise or motivational filler.",
+        "6. You cannot change data yourself. mark_absent and correct_category only "
+        "propose a change, which the user approves or rejects in the interface. When "
+        "the user asks to correct or relabel their data, call one of them, then say "
+        "exactly what will change (use the preview figures) and that it awaits their "
+        "approval. Never claim a change has been made.",
+        "7. Earlier turns of this conversation are context: resolve 'that day', 'it' "
+        "and similar references from them.",
         f"Today is {date.today().isoformat()}. {coverage}",
         language,
     ])
@@ -1093,6 +1270,106 @@ def _focus_blocks(facts: DayFacts) -> list[dict[str, object]]:
         })
     found.sort(key=lambda b: b["minutes"], reverse=True)
     return found[:5]
+
+
+def _day_zone(facts: DayFacts) -> tzinfo:
+    """The UTC offset the day was recorded in, or this machine's own."""
+    for segment in [*facts.activity, *facts.attention]:
+        zone = datetime.fromisoformat(str(segment["started_at"])).tzinfo
+        if zone is not None:
+            return zone
+    return datetime.now().astimezone().tzinfo  # type: ignore[return-value]
+
+
+def _day_span(facts: DayFacts) -> tuple[datetime, datetime, tzinfo] | None:
+    segments = [*facts.activity, *facts.attention]
+    if not segments:
+        return None
+    start = min(_utc(s.get("started_at_utc") or s["started_at"]) for s in segments)
+    end = max(_utc(s.get("ended_at_utc") or s["ended_at"]) for s in segments)
+    return start, end + timedelta(seconds=1), _day_zone(facts)
+
+
+def _app_ranges(facts: DayFacts, app: str) -> list[tuple[datetime, datetime]]:
+    """Every stretch ``app`` was in front, joining stretches under 2 minutes apart."""
+    wanted = app.lower()
+    ranges: list[list[datetime]] = []
+    for segment in facts.activity:
+        if str(segment.get("process_name") or "").lower() != wanted:
+            continue
+        start = _utc(segment.get("started_at_utc") or segment["started_at"])
+        end = _utc(segment.get("ended_at_utc") or segment["ended_at"])
+        if ranges and (start - ranges[-1][1]).total_seconds() <= 120:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    return [(start, end) for start, end in ranges if end > start]
+
+
+def _clock_range(facts: DayFacts, day: str, args: dict[str, object]) -> tuple[datetime, datetime]:
+    start_text = str(args.get("start_time") or "").strip()
+    end_text = str(args.get("end_time") or "").strip()
+    if not start_text or not end_text:
+        raise ToolError("give app, or both start_time and end_time as HH:MM")
+    zone = _day_zone(facts)
+    start, end = _local_time(day, start_text, zone), _local_time(day, end_text, zone)
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def _local_time(day: str, text: str, zone: tzinfo) -> datetime:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise ToolError(f"time must be HH:MM, got {text!r}")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    base = date.fromisoformat(day)
+    if (hour, minute) == (24, 0):
+        return datetime.combine(base + timedelta(days=1), day_time.min, tzinfo=zone)
+    if hour > 23 or minute > 59:
+        raise ToolError(f"time must be HH:MM, got {text!r}")
+    return datetime.combine(base, day_time(hour, minute), tzinfo=zone)
+
+
+def _absence_preview(facts: DayFacts, ranges: list[tuple[datetime, datetime]]) -> dict[str, object]:
+    """What marking ``ranges`` as away would change on this day."""
+    def shared(segment: dict[str, object]) -> float:
+        start = _utc(segment.get("started_at_utc") or segment["started_at"])
+        end = _utc(segment.get("ended_at_utc") or segment["ended_at"])
+        return sum(max(0.0, (min(end, e) - max(start, s)).total_seconds()) for s, e in ranges)
+
+    removed = sum(
+        shared(segment) * float(segment.get("attention_weight") or 0.0)
+        for segment in facts.attention
+        if float(segment.get("attention_weight") or 0.0) > 0
+    )
+    apps: Counter = Counter()
+    for segment in facts.activity:
+        apps[str(segment.get("process_name") or UNKNOWN_APP)] += shared(segment)
+    zone = _day_zone(facts)
+    before = facts.effective_seconds
+    return {
+        "date": facts.date,
+        "stretches": len(ranges),
+        "from": _clock(min(s for s, _ in ranges).astimezone(zone).isoformat()),
+        "to": _clock(max(e for _, e in ranges).astimezone(zone).isoformat()),
+        "marked_hours": _h(sum((e - s).total_seconds() for s, e in ranges)),
+        "effective_hours_before": _h(before) if facts.attention_tracked else None,
+        "effective_hours_after": _h(max(0.0, before - removed)) if facts.attention_tracked else None,
+        # Under 3 minutes would show as 0.0 h.
+        "app_hours_inside": [
+            {"app": name, "hours": _h(seconds)} for name, seconds in apps.most_common(5) if seconds >= 180
+        ],
+    }
+
+
+def _matches_scope(segment: dict[str, object], scope: str, pattern: str) -> bool:
+    if scope == "process":
+        return str(segment.get("process_name") or "").lower() == pattern
+    if scope == "site":
+        site = str(segment.get("site") or "")
+        return site == pattern or site.endswith("." + pattern)
+    return pattern in str(segment.get("window_title") or "").lower()
 
 
 def _split_by_hour(segment: dict[str, object]):

@@ -85,6 +85,14 @@
   function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
   function overlap(a0, a1, b0, b1) { return Math.max(0, Math.min(a1, b1) - Math.max(a0, b0)); }
   function fmtWeight(w) { w = (w == null ? 0 : w); return (w % 1 === 0) ? w.toFixed(1) : String(w); }
+  function fmtBytes(n) {
+    n = n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + " KB";
+    return n + " B";
+  }
+  function fmtCount(n) { return (n || 0).toLocaleString("en-US"); }
   function nowMinutes() { var d = new Date(); return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60; }
 
   // ---------- data ----------
@@ -94,7 +102,50 @@
     try { return JSON.parse(node.textContent); } catch (e) { return null; }
   }
 
-  function useReport() {
+  // Tracked dates, today and the date the server was started for. Refreshed
+  // now and then so a day the agent starts while the page is open appears.
+  function useDays(isStatic) {
+    var s = useState(null); var days = s[0], setDays = s[1];
+    useEffect(function () {
+      if (isStatic) return;
+      var alive = true, timer = null;
+      function load() {
+        fetch("/api/days", { cache: "no-store" })
+          .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+          .then(function (payload) { if (alive) setDays(payload); })
+          .catch(function () {})
+          .finally(function () { if (alive) timer = setTimeout(load, 60000); });
+      }
+      load();
+      return function () { alive = false; if (timer) clearTimeout(timer); };
+    }, [isStatic]);
+    return days;
+  }
+
+  // Database size and what fills it. Counting rows is cheap but not free, so
+  // this refreshes once a minute rather than with every report poll.
+  function useStorage(isStatic, refreshKey) {
+    var s = useState(null); var storage = s[0], setStorage = s[1];
+    useEffect(function () {
+      if (isStatic) return;
+      var alive = true, timer = null;
+      function load() {
+        fetch("/api/storage", { cache: "no-store" })
+          .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+          .then(function (payload) { if (alive) setStorage(payload); })
+          .catch(function () {})
+          .finally(function () { if (alive) timer = setTimeout(load, 60000); });
+      }
+      load();
+      return function () { alive = false; if (timer) clearTimeout(timer); };
+    }, [isStatic, refreshKey]);
+    return storage;
+  }
+
+  // The report for one day. Only today is live: it is polled at the pace of
+  // the agent, while a past day is fetched once. The data of the previous day
+  // stays on screen until the next arrives, so switching does not blank the page.
+  function useReport(date, today, refreshKey) {
     var inline = useMemo(readInlineData, []);
     var isStatic = !!inline;
     var state = useState(inline);
@@ -102,33 +153,36 @@
     var errState = useState(null); var error = errState[0], setError = errState[1];
     var stampState = useState(inline ? Date.now() : null);
     var updatedAt = stampState[0], setUpdatedAt = stampState[1];
+    var loadingState = useState(false); var loading = loadingState[0], setLoading = loadingState[1];
 
     useEffect(function () {
-      if (isStatic) return;
+      if (isStatic || !date) return;
       var alive = true;
       var timer = null;
       var nextDelay = 5000;
+      var live = date === today;
+      setLoading(true);
       function tick() {
-        fetch("/api/report?date=today", { cache: "no-store" })
+        fetch("/api/report?date=" + (live ? "today" : date), { cache: "no-store" })
           .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
           .then(function (payload) {
             if (!alive) return;
-            setData(payload); setError(null); setUpdatedAt(Date.now());
+            setData(payload); setError(null); setUpdatedAt(Date.now()); setLoading(false);
             var agent = payload && payload.agent;
             nextDelay = Math.max(2000, ((agent && agent.poll_interval_seconds) || 5) * 1000);
           })
-          .catch(function (e) { if (alive) setError(String(e.message || e)); })
+          .catch(function (e) { if (alive) { setError(String(e.message || e)); setLoading(false); } })
           .finally(function () {
-            if (!alive) return;
+            if (!alive || !live) return;
             timer = setTimeout(tick, nextDelay);
           });
       }
       tick();
       return function () { alive = false; if (timer) clearTimeout(timer); };
       // eslint-disable-next-line
-    }, [isStatic]);
+    }, [isStatic, date, today, refreshKey]);
 
-    return { data: data, error: error, updatedAt: updatedAt, isStatic: isStatic };
+    return { data: data, error: error, updatedAt: updatedAt, isStatic: isStatic, loading: loading };
   }
 
   // ---------- derived analytics ----------
@@ -638,7 +692,7 @@
         <div className="tt-row"><${Swatch} color=${STATE_COLOR[at.att.seg.state]} />
           <span className="nm">${STATE_LABEL[at.att.seg.state]} ×${fmtWeight(at.att.seg.weight)}</span>
           <span className="val">${fmtDur(at.att.seg.duration_seconds)}</span></div>
-        <div className="tt-sub">${at.att.seg.start_label.slice(0, 5)}–${at.att.seg.end_label.slice(0, 5)}${at.att.seg.max_idle_seconds != null ? " · max idle " + fmtDur(at.att.seg.max_idle_seconds) : ""}</div>
+        <div className="tt-sub">${at.att.seg.start_label.slice(0, 5)}–${at.att.seg.end_label.slice(0, 5)}${at.att.seg.annotation ? " · marked " + at.att.seg.annotation : at.att.seg.max_idle_seconds != null ? " · max idle " + fmtDur(at.att.seg.max_idle_seconds) : ""}</div>
       </div>` : null}
       ${at.act ? html`<div>
         <div className="tt-row"><${Swatch} color=${appColorOf(d, at.act.seg.process)} />
@@ -935,28 +989,517 @@
     </details>`;
   }
 
+  // ---------- date navigation ----------
+  function DateNav(props) {
+    var days = props.days, date = props.date, setDate = props.setDate;
+    var dates = days.dates.slice();
+    if (dates.indexOf(days.today) < 0) dates.push(days.today);   // today is always selectable: it is live
+    var i = dates.indexOf(date);
+    var prev = i > 0 ? dates[i - 1] : null;
+    var next = i >= 0 && i < dates.length - 1 ? dates[i + 1] : null;
+    return html`<div className="date-nav">
+      <button type="button" className="btn" disabled=${!prev} title="Previous tracked day"
+        onClick=${function () { setDate(prev); }}>‹</button>
+      <select className="date-select" value=${date} aria-label="Day"
+        onChange=${function (ev) { setDate(ev.target.value); }}>
+        ${dates.slice().reverse().map(function (d) {
+          return html`<option key=${d} value=${d}>${d === days.today ? d + " · today" : d}</option>`;
+        })}
+      </select>
+      <button type="button" className="btn" disabled=${!next} title="Next tracked day"
+        onClick=${function () { setDate(next); }}>›</button>
+      ${date !== days.today
+        ? html`<button type="button" className="btn" onClick=${function () { setDate(days.today); }}>Today</button>`
+        : null}
+    </div>`;
+  }
+
+  // ---------- storage ----------
+  function StoragePanel(props) {
+    var s = props.storage;
+    var total = s.file_bytes + s.wal_bytes;
+    var pages = s.used_bytes + s.free_bytes;
+    var span = function (first, last) { return first ? (first === last ? first : first + " → " + last) : "—"; };
+    var rows = [
+      ["Raw samples", fmtCount(s.raw.rows) + " rows",
+       s.raw.days + " day(s) · " + span(s.raw.first_date, s.raw.last_date) + " · kept " + s.raw.retention_days + " days"],
+      ["Archived days", s.archived.days + " day(s)",
+       span(s.archived.first_date, s.archived.last_date) + " · " + fmtCount(s.archived.activity_segments) +
+       " activity + " + fmtCount(s.archived.attention_segments) + " attention segments"],
+      ["Heartbeats", fmtCount(s.heartbeats) + " rows", "liveness and missing-data detection"],
+      ["Applications", fmtCount(s.applications) + " apps", "lookup table shared by every sample"]
+    ];
+    var freeShare = pages ? s.free_bytes / pages : 0;
+    return html`<section className="panel storage">
+      <header>
+        <h2>Storage <span>// local SQLite · schema v${s.schema_version}</span></h2>
+        <div className="hint" title=${s.path}>${s.path}</div>
+      </header>
+      <div className="storage-head">
+        <div><div className="k">File</div><div className="big">${fmtBytes(total)}</div>
+          <div className="foot">${s.wal_bytes ? "incl. " + fmtBytes(s.wal_bytes) + " write-ahead log" : "write-ahead log empty"}</div></div>
+        <div><div className="k">In use</div><div className="big">${fmtBytes(s.used_bytes)}</div>
+          <div className="foot">pages holding data</div></div>
+        <div><div className="k">Free</div><div className="big">${fmtBytes(s.free_bytes)}</div>
+          <div className="foot">freed but still in the file</div></div>
+      </div>
+      <div className="stack" title=${"in use " + fmtBytes(s.used_bytes) + " · free " + fmtBytes(s.free_bytes)}>
+        <div style=${{ flex: (1 - freeShare) + " 0 0", background: "var(--accent)", opacity: 0.8 }}></div>
+        ${freeShare > 0 ? html`<div style=${{ flex: freeShare + " 0 0", background: "var(--ink-3)", opacity: 0.5 }}></div>` : null}
+      </div>
+      <div className="storage-rows">
+        ${rows.map(function (r) {
+          return html`<div className="storage-row" key=${r[0]}>
+            <span className="name">${r[0]}</span><span className="val">${r[1]}</span><span className="detail">${r[2]}</span>
+          </div>`;
+        })}
+      </div>
+      ${s.raw.pending_archive_days > 0 ? html`<div className="notice">
+        ${s.raw.pending_archive_days} raw day(s) are past retention. Archiving turns the samples of each day into a
+        few hundred segments and frees most of their space: focusledger db prune</div>` : null}
+      ${freeShare > 0.05 ? html`<div className="notice">
+        ${fmtBytes(s.free_bytes)} of the file is free space SQLite will reuse. To give it back to the disk now,
+        stop the agent and run: focusledger db compact --yes</div>` : null}
+      <div className="foot-line">Last archive run: ${s.last_archive_run_at ? s.last_archive_run_at.slice(0, 16).replace("T", " ") + " UTC" : "never"}</div>
+    </section>`;
+  }
+
+  // ---------- analyst ----------
+  var SUGGESTED_QUESTIONS = [
+    "我有记录的最近 7 天，时间主要花在了哪些类别和应用上？",
+    "一天里我通常哪几个小时最专注？",
+    "把最近 7 个有记录的日子和再往前 7 个有记录的日子对比，游戏时间和有效时间有什么变化？",
+    "我有记录的最后一天都做了什么？哪段时间最专注？"
+  ];
+  var INLINE_TOKEN = /(\*\*[^*]+\*\*|\x60[^\x60]+\x60|\b\d{4}-\d{2}-\d{2}\b)/g;
+  function openDay(onDate, day) { return function () { onDate(day); }; }
+
+  // Bold, code and dates inside one line of an answer. A tracked date becomes
+  // a link that opens that day in the report above.
+  function inlineMarkdown(text, ctx, key) {
+    var out = [], last = 0, n = 0, m;
+    INLINE_TOKEN.lastIndex = 0;
+    while ((m = INLINE_TOKEN.exec(text))) {
+      if (m.index > last) out.push(text.slice(last, m.index));
+      var tok = m[0], k = key + "-" + (n++);
+      if (tok.slice(0, 2) === "**") out.push(html`<strong key=${k}>${tok.slice(2, -2)}</strong>`);
+      else if (tok.charAt(0) === "\x60") out.push(html`<code key=${k}>${tok.slice(1, -1)}</code>`);
+      else if (ctx.onDate && ctx.dates.indexOf(tok) >= 0) {
+        out.push(html`<button key=${k} type="button" className="date-link" title="Open this day in the report"
+          onClick=${openDay(ctx.onDate, tok)}>${tok}</button>`);
+      } else out.push(tok);
+      last = INLINE_TOKEN.lastIndex;
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  }
+
+  // The few Markdown blocks local models actually produce. Built as React
+  // elements, never as HTML strings, so an answer cannot inject markup.
+  function Markdown(props) {
+    var ctx = { onDate: props.onDate, dates: props.dates || [] };
+    var lines = String(props.text || "").split(/\r?\n/);
+    var isRow = function (l) { return /^\s*\|.*\|\s*$/.test(l); };
+    var isItem = function (l) { return /^\s*([-*]|\d+\.)\s+/.test(l); };
+    var isHead = function (l) { return /^\s*#{1,6}\s/.test(l); };
+    var blocks = [], i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+      if (isRow(line)) {
+        var rows = [];
+        while (i < lines.length && isRow(lines[i])) { rows.push(lines[i]); i++; }
+        var cells = rows.filter(function (r) { return !/^\s*\|[\s:|-]+\|\s*$/.test(r); })
+          .map(function (r) { return r.trim().slice(1, -1).split("|").map(function (c) { return c.trim(); }); });
+        blocks.push({ type: "table", head: cells[0] || [], body: cells.slice(1) });
+      } else if (isHead(line)) {
+        blocks.push({ type: "h", text: line.replace(/^\s*#+\s*/, "") }); i++;
+      } else if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+        blocks.push({ type: "hr" }); i++;
+      } else if (isItem(line)) {
+        var ordered = /^\s*\d+\./.test(line), items = [];
+        while (i < lines.length && isItem(lines[i])) { items.push(lines[i].replace(/^\s*([-*]|\d+\.)\s+/, "")); i++; }
+        blocks.push({ type: ordered ? "ol" : "ul", items: items });
+      } else {
+        var para = [line]; i++;
+        while (i < lines.length && lines[i].trim() && !isRow(lines[i]) && !isItem(lines[i]) && !isHead(lines[i])) {
+          para.push(lines[i]); i++;
+        }
+        blocks.push({ type: "p", text: para.join("\n") });
+      }
+    }
+    return html`<div className="answer">
+      ${blocks.map(function (b, bi) {
+        var k = "b" + bi;
+        if (b.type === "h") return html`<h4 key=${k}>${inlineMarkdown(b.text, ctx, k)}</h4>`;
+        if (b.type === "hr") return html`<hr key=${k} />`;
+        if (b.type === "p") return html`<p key=${k}>${inlineMarkdown(b.text, ctx, k)}</p>`;
+        if (b.type === "ul" || b.type === "ol") {
+          var items = b.items.map(function (t, ii) { return html`<li key=${ii}>${inlineMarkdown(t, ctx, k + "-" + ii)}</li>`; });
+          return b.type === "ol" ? html`<ol key=${k}>${items}</ol>` : html`<ul key=${k}>${items}</ul>`;
+        }
+        return html`<div className="answer-table" key=${k}><table>
+          <thead><tr>${b.head.map(function (c, ci) { return html`<th key=${ci}>${inlineMarkdown(c, ctx, k + "h" + ci)}</th>`; })}</tr></thead>
+          <tbody>${b.body.map(function (r, ri) {
+            return html`<tr key=${ri}>${r.map(function (c, ci) { return html`<td key=${ci}>${inlineMarkdown(c, ctx, k + "r" + ri + "c" + ci)}</td>`; })}</tr>`;
+          })}</tbody>
+        </table></div>`;
+      })}
+    </div>`;
+  }
+
+  function ToolCallRow(props) {
+    var c = props.call;
+    var args = Object.keys(c.arguments || {}).map(function (k) { return k + "=" + c.arguments[k]; }).join(", ");
+    var failed = !!(c.result && c.result.error);
+    return html`<details className=${"tool-call" + (failed ? " failed" : "")}>
+      <summary>
+        <span className="tc-name">${c.name}</span><span className="tc-args">(${args})</span>
+        <span className="tc-time">${failed ? "error · " : ""}${(c.seconds || 0).toFixed(1)}s</span>
+      </summary>
+      <pre className="tc-json">${JSON.stringify(c.result, null, 2)}</pre>
+    </details>`;
+  }
+
+  // Small helpers for the JSON POSTs the analyst panel sends. The server only
+  // accepts JSON bodies, which is what keeps other sites from posting here.
+  function postJson(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      return r.json().then(function (payload) {
+        if (!r.ok) throw new Error(payload.error || "HTTP " + r.status);
+        return payload;
+      });
+    });
+  }
+  function readFlag(key) { try { return window.localStorage.getItem(key) === "1"; } catch (e) { return false; } }
+  function writeFlag(key, on) { try { window.localStorage.setItem(key, on ? "1" : "0"); } catch (e) {} }
+
+  function ProposalPreview(props) {
+    var p = props.preview || {}, action = props.action;
+    if (action === "mark_absent") {
+      return html`<div className="pp">
+        ${p.marked_hours} h marked on ${p.date} · ${p.stretches} stretch(es) ${p.from}–${p.to}
+        ${p.effective_hours_before != null
+          ? html`<div>effective time ${p.effective_hours_before} h → <b>${p.effective_hours_after} h</b></div>` : null}
+        ${(p.app_hours_inside || []).length ? html`<div className="pp-apps">inside: ${p.app_hours_inside.map(function (a) {
+          return a.app + " " + a.hours + " h"; }).join(" · ")}</div>` : null}
+      </div>`;
+    }
+    if (action === "correct_category") {
+      var recent = p.last_7_tracked_days || {};
+      var cats = Object.keys(recent.current_categories || {}).map(function (k) {
+        return k + " " + recent.current_categories[k] + " h"; }).join(" · ");
+      return html`<div className="pp">
+        ${recent.matching_hours || 0} h in the last 7 tracked days${cats ? " · now " + cats : ""}
+        ${p.replaces_correction ? html`<div>replaces your earlier correction: ${p.replaces_correction}</div>` : null}
+      </div>`;
+    }
+    return html`<pre className="tc-json">${JSON.stringify(p, null, 2)}</pre>`;
+  }
+
+  // A change the model proposed. Nothing is written until Approve; an applied
+  // change can be undone from the same card. Its status lives in the panel,
+  // so folding the run away and back does not lose it.
+  function ProposalCard(props) {
+    var proposal = props.proposal;
+    var busyState = useState(false); var busy = busyState[0], setBusy = busyState[1];
+    var errState = useState(null); var error = errState[0], setError = errState[1];
+
+    function act(promise, after) {
+      setBusy(true); setError(null);
+      promise.then(function (payload) { after(payload); if (props.onChanged) props.onChanged(); })
+        .catch(function (e) { setError(String(e.message || e)); })
+        .finally(function () { setBusy(false); });
+    }
+    function decide(decision) {
+      act(postJson("/api/analyst/proposals/" + proposal.id, { decision: decision }), props.onUpdate);
+    }
+    function undo() {
+      act(postJson("/api/changes/" + proposal.change_id + "/undo", {}), function () {
+        props.onUpdate(Object.assign({}, proposal, { status: "undone" }));
+      });
+    }
+    var status = proposal.status;
+    return html`<div className=${"proposal " + status}>
+      <div className="pp-head">
+        <span className=${"pill " + (status === "applied" ? "good" : "warn")}>${
+          status === "pending" ? "needs your approval" : status === "applying" ? "applying" : status}</span>
+        <span className="pp-summary">${proposal.summary}</span>
+      </div>
+      <${ProposalPreview} action=${proposal.action} preview=${proposal.preview} />
+      <div className="pp-actions">
+        ${status === "pending" ? html`<span>
+          <button type="button" className="btn on" disabled=${busy} onClick=${function () { decide("approve"); }}>Approve</button>
+          <button type="button" className="btn" disabled=${busy} onClick=${function () { decide("dismiss"); }}>Dismiss</button>
+        </span>` : null}
+        ${status === "applied" && proposal.change_id ? html`<button type="button" className="btn" disabled=${busy}
+          onClick=${undo}>Undo</button>` : null}
+        ${status === "undone" ? html`<span className="hint">undone · your data is back as it was</span>` : null}
+        ${status === "dismissed" ? html`<span className="hint">dismissed · nothing was changed</span>` : null}
+      </div>
+      ${error ? html`<div className="error-banner">${error}</div>` : null}
+    </div>`;
+  }
+
+  // Every change made on your behalf, kept in the database, so one can still
+  // be undone after the page that approved it is gone.
+  function ChangeLog(props) {
+    var lState = useState(null); var list = lState[0], setList = lState[1];
+    var busyState = useState(null); var busy = busyState[0], setBusy = busyState[1];
+    var errState = useState(null); var error = errState[0], setError = errState[1];
+    useEffect(function () {
+      var alive = true;
+      fetch("/api/changes", { cache: "no-store" })
+        .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function (payload) { if (alive) setList(payload.changes || []); })
+        .catch(function () {});
+      return function () { alive = false; };
+    }, [props.refreshKey]);
+    if (!list || !list.length) return null;
+
+    function undo(id) {
+      setBusy(id); setError(null);
+      postJson("/api/changes/" + id + "/undo", {})
+        .then(function () { props.onUndone(id); })
+        .catch(function (e) { setError(String(e.message || e)); })
+        .finally(function () { setBusy(null); });
+    }
+    var active = list.filter(function (c) { return !c.undone_at; }).length;
+    return html`<details className="changes">
+      <summary>Changes made for you · ${active} active${list.length > active ? " · " + (list.length - active) + " undone" : ""}</summary>
+      ${list.map(function (c) {
+        return html`<div key=${c.id} className=${"change-row" + (c.undone_at ? " undone" : "")}>
+          <span className="when">${new Date(c.created_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+          <span className="what">${c.summary}</span>
+          ${c.undone_at ? html`<span className="hint">undone</span>`
+            : html`<button type="button" className="btn" disabled=${busy === c.id} onClick=${function () { undo(c.id); }}>Undo</button>`}
+        </div>`;
+      })}
+      ${error ? html`<div className="error-banner">${error}</div>` : null}
+    </details>`;
+  }
+
+  function Thinking(props) {
+    var thinking = props.thinking || [];
+    if (!thinking.length) return null;
+    var chars = thinking.reduce(function (a, t) { return a + t.length; }, 0);
+    return html`<details className="thinking" open=${props.running}>
+      <summary>Thinking · ${thinking.length} step${thinking.length === 1 ? "" : "s"} · ${fmtCount(chars)} chars</summary>
+      ${thinking.map(function (t, i) { return html`<pre key=${i} className="thought">${t}</pre>`; })}
+    </details>`;
+  }
+
+  function AnalystRun(props) {
+    var job = props.job;
+    var running = job.status === "running";
+    var cState = useState(!!props.collapsed); var collapsed = cState[0], setCollapsed = cState[1];
+    // Fold an answer away once a newer one arrives; the user can reopen it.
+    useEffect(function () { if (props.collapsed) setCollapsed(true); }, [props.collapsed]);
+    var shown = running || !collapsed;
+    return html`<article className=${"run" + (running ? " running" : "") + (shown ? "" : " collapsed")}>
+      <button type="button" className="run-q" aria-expanded=${shown}
+        onClick=${function () { if (!running) setCollapsed(!collapsed); }}>${job.question}</button>
+      ${shown ? html`<div>
+      <${Thinking} thinking=${job.thinking} running=${running} />
+      ${(job.tool_calls || []).length ? html`<div className="run-tools">
+        <div className="hint">DATA THE MODEL LOOKED AT · click to see exactly what it got</div>
+        ${job.tool_calls.map(function (c, i) { return html`<${ToolCallRow} key=${i} call=${c} />`; })}
+      </div>` : null}
+      ${running ? html`<div className="run-wait"><span className="spinner"></span>
+        ${job.model} is ${(job.tool_calls || []).length ? "working through the data" : "reading the question"} · ${Math.round(job.elapsed_seconds || 0)}s</div>` : null}
+      ${job.status === "error" ? html`<div className="error-banner">${job.error}</div>` : null}
+      ${job.status === "done" ? html`<div>
+        <${Markdown} text=${job.answer || "(no answer)"} onDate=${props.onDate} dates=${props.dates} />
+        ${(job.ungrounded_numbers || []).length ? html`<div className="warn-note">
+          These numbers appear in no tool result, so the model may have computed or invented them:
+          ${" " + job.ungrounded_numbers.join(", ")}</div>` : null}
+        <div className="run-meta">
+          ${job.model} · ${job.tool_mode} tool calls · ${(job.tool_calls || []).length} lookups · ${Math.round(job.elapsed_seconds || 0)}s
+          ${(job.corrections || []).map(function (c, i) {
+            return html`<span key=${i} className="pill warn" title=${c}>sent back once</span>`;
+          })}
+          ${job.stop_reason === "round_limit" ? html`<span className="pill warn">stopped at the round limit</span>` : null}
+        </div>
+      </div>` : null}
+      ${(job.proposals || []).map(function (p) {
+        return html`<${ProposalCard} key=${p.id} proposal=${p} onUpdate=${props.onProposal}
+          onChanged=${props.onChanged} />`;
+      })}
+      </div>` : null}
+    </article>`;
+  }
+
+  function AnalystPanel(props) {
+    var mState = useState(null); var models = mState[0], setModels = mState[1];
+    var selState = useState(""); var model = selState[0], setModel = selState[1];
+    var qState = useState(""); var question = qState[0], setQuestion = qState[1];
+    var jobState = useState(null); var job = jobState[0], setJob = jobState[1];
+    var histState = useState([]); var history = histState[0], setHistory = histState[1];
+    var errState = useState(null); var error = errState[0], setError = errState[1];
+
+    useEffect(function () {
+      fetch("/api/analyst/models", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (payload) {
+          setModels(payload);
+          var installed = payload.models || [];
+          setModel(installed.indexOf(payload.default) >= 0 ? payload.default : (installed[0] || ""));
+        })
+        .catch(function (e) { setModels({ available: false, models: [], detail: String(e.message || e) }); });
+    }, []);
+
+    // Poll the running job; each snapshot re-arms the timer until it settles.
+    useEffect(function () {
+      if (!job || job.status !== "running") return;
+      var alive = true;
+      var timer = setTimeout(function () {
+        fetch("/api/analyst/jobs/" + job.id, { cache: "no-store" })
+          .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+          .then(function (snap) {
+            if (!alive) return;
+            if (snap.status === "running") { setJob(snap); return; }
+            setJob(null);
+            setHistory(function (h) { return [snap].concat(h).slice(0, 10); });
+          })
+          .catch(function (e) { if (alive) { setError(String(e.message || e)); setJob(null); } });
+      }, 900);
+      return function () { alive = false; clearTimeout(timer); };
+    }, [job]);
+
+    var foldState = useState(function () { return readFlag("fl.analyst.folded"); });
+    var folded = foldState[0], setFolded = foldState[1];
+    function toggleFold() { setFolded(!folded); writeFlag("fl.analyst.folded", !folded); }
+
+    // A decided proposal replaces its copy in whichever run holds it.
+    function patchProposals(match, fields) {
+      function patch(run) {
+        if (!run || !(run.proposals || []).some(match)) return run;
+        return Object.assign({}, run, { proposals: run.proposals.map(function (p) {
+          return match(p) ? Object.assign({}, p, fields) : p;
+        }) });
+      }
+      setJob(patch);
+      setHistory(function (h) { return h.map(patch); });
+    }
+    function updateProposal(updated) {
+      patchProposals(function (p) { return p.id === updated.id; }, updated);
+    }
+    function changeUndone(changeId) {
+      patchProposals(function (p) { return p.change_id === changeId; }, { status: "undone" });
+      if (props.onChanged) props.onChanged();
+    }
+
+    var busy = !!job;
+    function ask(text) {
+      var q = String(text == null ? question : text).trim();
+      if (!q || busy) return;
+      setError(null);
+      // Earlier answered turns, oldest first, so a follow-up such as "mark
+      // that day" can be resolved. The server keeps the last four.
+      var turns = history.filter(function (h) { return h.status === "done" && h.answer; })
+        .slice(0, 4).reverse()
+        .map(function (h) { return { question: h.question, answer: h.answer.slice(0, 6000) }; });
+      postJson("/api/analyst/ask", { question: q, model: model || null, history: turns })
+        .then(function (snapshot) { setJob(snapshot); setQuestion(""); })
+        .catch(function (e) { setError(String(e.message || e)); });
+    }
+
+    var unavailable = models && !models.available;
+    return html`<section className=${"panel analyst" + (folded ? " folded" : "")}>
+      <header>
+        <h2>
+          <button type="button" className="fold-btn" aria-expanded=${!folded} onClick=${toggleFold}
+            title=${folded ? "Show the analyst" : "Hide the analyst"}>${folded ? "+" : "-"}</button>
+          Ask the Analyst <span>// local model · every number checked against your data · changes need your approval</span>
+        </h2>
+        ${!folded && models && models.models && models.models.length ? html`<div className="controls">
+          ${history.length && !busy ? html`<button type="button" className="btn" title="Forget earlier questions"
+            onClick=${function () { setHistory([]); setError(null); }}>New conversation</button>` : null}
+          <span className="hint">MODEL</span>
+          <select className="date-select" value=${model} disabled=${busy} aria-label="Model"
+            onChange=${function (ev) { setModel(ev.target.value); }}>
+            ${models.models.map(function (m) { return html`<option key=${m} value=${m}>${m}${m === models.default ? " · default" : ""}</option>`; })}
+          </select>
+        </div>` : null}
+        ${folded && (busy || history.length) ? html`<span className="hint">${busy ? "working…" : history.length + " answer(s) hidden"}</span>` : null}
+      </header>
+      ${folded ? null : html`<div>
+      ${unavailable ? html`<div className="warn-note">
+        The local model is not reachable${models.detail ? " (" + models.detail + ")" : ""}.
+        Start Ollama and pull a model, e.g. ollama pull ${models.default || "qwen3.5:9b"}.</div>` : null}
+      <form className="ask-row" onSubmit=${function (ev) { ev.preventDefault(); ask(); }}>
+        <textarea rows="2" value=${question} disabled=${busy || unavailable} maxLength="1000"
+          placeholder=${history.length
+            ? "Follow up; the model sees your last answers, e.g. 把那天的 unknown 标成睡觉  (Ctrl+Enter to send)"
+            : "Ask about your tracked time, e.g. 上周我的时间主要花在哪里？  (Ctrl+Enter to send)"}
+          onChange=${function (ev) { setQuestion(ev.target.value); }}
+          onKeyDown=${function (ev) { if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); ask(); } }}></textarea>
+        <button type="submit" className="btn on" disabled=${busy || unavailable || !question.trim()}>${busy ? "Working…" : "Ask"}</button>
+      </form>
+      ${!busy && !history.length ? html`<div className="suggest">
+        ${SUGGESTED_QUESTIONS.map(function (q) {
+          return html`<button key=${q} type="button" className="chip" disabled=${unavailable}
+            onClick=${function () { ask(q); }}>${q}</button>`;
+        })}
+      </div>` : null}
+      ${error ? html`<div className="error-banner">${error}</div>` : null}
+      ${job ? html`<${AnalystRun} job=${job} onDate=${props.onDate} dates=${props.dates}
+        onProposal=${updateProposal} onChanged=${props.onChanged} />` : null}
+      ${history.map(function (h, i) {
+        return html`<${AnalystRun} key=${h.id} job=${h} collapsed=${i > 0 || !!job}
+          onDate=${props.onDate} dates=${props.dates} onProposal=${updateProposal} onChanged=${props.onChanged} />`;
+      })}
+      <${ChangeLog} refreshKey=${props.refreshKey} onUndone=${changeUndone} />
+      </div>`}
+    </section>`;
+  }
+
   // ---------- app ----------
   function App() {
-    var rep = useReport();
+    var isStatic = useMemo(function () { return !!readInlineData(); }, []);
+    var days = useDays(isStatic);
+    // Bumped when an approved change rewrites how the data reads.
+    var refreshState = useState(0); var refreshKey = refreshState[0], setRefreshKey = refreshState[1];
+    var onDataChanged = useCallback(function () { setRefreshKey(function (k) { return k + 1; }); }, []);
+    var storage = useStorage(isStatic, refreshKey);
+    var storageOpen = useState(false); var showStorage = storageOpen[0], setShowStorage = storageOpen[1];
+    var dateState = useState(null); var date = dateState[0], setDate = dateState[1];
+    useEffect(function () { if (days && !date) setDate(days.initial); }, [days, date]);
+    var rep = useReport(date, days && days.today, refreshKey);
     var data = rep.data;
     var d = useDerived(data);
     var viewState = useState(null); var view = viewState[0], setView = viewState[1];
     var isoState = useState(null); var isolated = isoState[0], setIsolated = isoState[1];
     var hoverState = useState(null); var hoverApp = hoverState[0], setHoverApp = hoverState[1];
     var followRef = useRef(true);
+    var viewDateRef = useRef(null);
 
-    // Keep zoom across live refreshes; follow the right edge if we were pinned there.
+    // Keep zoom across live refreshes; follow the right edge if we were pinned
+    // there. A different day starts again from its whole span.
     var domain = d && d.domain;
+    var dataDate = data && data.meta && data.meta.date;
     useEffect(function () {
       if (!domain) return;
+      var fresh = viewDateRef.current !== dataDate;
+      viewDateRef.current = dataDate;
+      if (fresh) followRef.current = true;
       setView(function (prev) {
-        if (!prev) return { start: domain.start, end: domain.end };
+        if (!prev || fresh) return { start: domain.start, end: domain.end };
         var sp = Math.min(prev.end - prev.start, domain.end - domain.start);
         if (followRef.current) return { start: Math.max(domain.start, domain.end - sp), end: domain.end };
         var s = clamp(prev.start, domain.start, domain.end - sp);
         return { start: s, end: s + sp };
       });
-    }, [domain && domain.start, domain && domain.end]);
+    }, [domain && domain.start, domain && domain.end, dataDate]);
+
+    var openDate = useCallback(function (day) {
+      setDate(day);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }, []);
 
     var setViewTracked = useCallback(function (v) {
       setView(function (prev) {
@@ -997,6 +1540,8 @@
     var meta = data.meta || {};
     var agent = data.agent;
     var live = !rep.isStatic && meta.live !== false;
+    var lastTracked = days && days.dates.length ? days.dates[days.dates.length - 1] : null;
+    var switching = rep.loading;
 
     return html`<div className="console">
       <div className="masthead">
@@ -1006,16 +1551,35 @@
           <${LivePill} agent=${agent} isStatic=${rep.isStatic} />
         </div>
         <div className="meta-grid">
-          <div><div className="k">Date</div><div className="v">${meta.date}</div></div>
+          <div><div className="k">Date</div><div className="v">${days && date
+            ? html`<${DateNav} days=${days} date=${date} setDate=${setDate} />` : meta.date}</div></div>
           <div><div className="k">Tracked</div><div className="v">${fmtDur(data.attention.raw_seconds)}</div></div>
+          ${storage ? html`<div><div className="k">Database</div><div className="v">
+            <button type="button" className=${"size-btn" + (showStorage ? " on" : "")}
+              title="Show what the database holds" aria-expanded=${showStorage}
+              onClick=${function () { setShowStorage(!showStorage); }}>${fmtBytes(storage.file_bytes + storage.wal_bytes)}</button>
+          </div></div>` : null}
           <div><div className="k">Updated</div><div className="v">${rep.updatedAt ? new Date(rep.updatedAt).toLocaleTimeString() : "—"}</div></div>
         </div>
       </div>
+      ${showStorage && storage ? html`<${StoragePanel} storage=${storage} />` : null}
 
       ${rep.error ? html`<div className="error-banner">Lost contact with the FocusLedger server (${rep.error}). Showing the last data received; retrying…</div>` : null}
+      ${agent && agent.pending_archive_days > 0 && !showStorage ? html`<div className="notice">
+        ${agent.pending_archive_days} day(s) of raw samples are past retention and not archived yet.
+        The agent archives them when it starts, or run: focusledger db prune</div>` : null}
 
+      ${!rep.isStatic ? html`<${AnalystPanel} onDate=${openDate} dates=${(days && days.dates) || []}
+        refreshKey=${refreshKey} onChanged=${onDataChanged} />` : null}
+
+      <div className=${switching ? "day is-loading" : "day"}>
       ${!d.hasData
-        ? html`<div className="empty">NO SAMPLES FOR THIS DAY YET</div>`
+        ? html`<div className="empty">
+            NO SAMPLES FOR THIS DAY${live ? " YET" : ""}
+            ${lastTracked && lastTracked !== meta.date ? html`<div style=${{ marginTop: "14px" }}>
+              <button type="button" className="btn on" onClick=${function () { setDate(lastTracked); }}>
+                Open the last tracked day · ${lastTracked}</button></div>` : null}
+          </div>`
         : html`<div>
             <${StatTiles} data=${data} derived=${d} />
             ${view ? html`<${ChartPanel} data=${data} derived=${d} view=${view} setView=${setViewTracked}
@@ -1033,6 +1597,7 @@
             <${ReviewPanel} d=${d} />
             <${TableView} d=${d} />
           </div>`}
+      </div>
 
       <div className="foot-note">
         Derived at request time from raw samples · poll ${meta.poll_interval_seconds}s

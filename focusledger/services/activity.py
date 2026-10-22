@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date, datetime, time, timedelta, timezone
 from sqlite3 import Connection
 
@@ -133,19 +134,21 @@ def day_segments(
     """A day's activity and attention segments, reading its raw samples once."""
     raw_rows = _list_raw_activity_events(conn, day)
     if raw_rows:
-        return (
-            _derive_activity_segments(raw_rows),
-            _derive_attention_segments(raw_rows, attention_policy or AttentionPolicy()),
-        )
-    return (
-        _list_archived_activity_segments(conn, day),
-        _list_archived_attention_segments(conn, day),
-    )
+        activity = _derive_activity_segments(raw_rows)
+        attention = _derive_attention_segments(raw_rows, attention_policy or AttentionPolicy())
+    else:
+        activity = _list_archived_activity_segments(conn, day)
+        attention = _list_archived_attention_segments(conn, day)
+    return activity, _apply_absences(conn, attention)
 
 
 def summarize_by_app(conn: Connection, day: date) -> list[dict[str, object]]:
+    return summarize_segments_by_app(list_timeline(conn, day))
+
+
+def summarize_segments_by_app(segments: list[dict[str, object]]) -> list[dict[str, object]]:
     summary: dict[str, dict[str, object]] = {}
-    for segment in list_timeline(conn, day):
+    for segment in segments:
         process_name = str(segment["process_name"] or "(unknown)")
         bucket = summary.setdefault(
             process_name,
@@ -172,11 +175,89 @@ def list_attention_segments(
 ) -> list[dict[str, object]]:
     raw_rows = _list_raw_activity_events(conn, day)
     if raw_rows:
-        return _derive_attention_segments(
-            raw_rows,
-            attention_policy or AttentionPolicy(),
-        )
-    return _list_archived_attention_segments(conn, day)
+        attention = _derive_attention_segments(raw_rows, attention_policy or AttentionPolicy())
+    else:
+        attention = _list_archived_attention_segments(conn, day)
+    return _apply_absences(conn, attention)
+
+
+def absences_between(
+    conn: Connection, start: datetime, end: datetime
+) -> list[tuple[datetime, datetime, str]]:
+    """Stretches the user marked as away (sleep, meal...) overlapping ``[start, end)``."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT started_at_utc, ended_at_utc, label FROM time_annotations
+            WHERE started_at_utc < ? AND ended_at_utc > ?
+            ORDER BY started_at_utc
+            """,
+            (end.astimezone(timezone.utc).isoformat(), start.astimezone(timezone.utc).isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError:  # a database from before v11
+        return []
+    return [(_parse_utc(row[0]), _parse_utc(row[1]), str(row[2])) for row in rows]
+
+
+def _apply_absences(
+    conn: Connection, segments: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Read attention inside a marked absence as hard idle with weight 0.
+
+    Applied on every read rather than stored, so archived days keep their
+    original reading and removing an annotation restores it.
+    """
+    if not segments:
+        return segments
+    start = min(_segment_utc(s, "started") for s in segments)
+    end = max(_segment_utc(s, "ended") for s in segments)
+    absences = absences_between(conn, start, end + timedelta(seconds=1))
+    if not absences:
+        return segments
+    out: list[dict[str, object]] = []
+    for segment in segments:
+        out.extend(_split_for_absences(segment, absences))
+    return out
+
+
+def _split_for_absences(
+    segment: dict[str, object], absences: list[tuple[datetime, datetime, str]]
+) -> list[dict[str, object]]:
+    start, end = _segment_utc(segment, "started"), _segment_utc(segment, "ended")
+    pieces: list[dict[str, object]] = []
+    cursor = start
+    for absence_start, absence_end, label in absences:
+        if absence_end <= cursor or absence_start > end or (absence_start == end and end > start):
+            continue
+        if absence_start > cursor:
+            pieces.append(_attention_piece(segment, cursor, absence_start))
+        low, high = max(cursor, absence_start), min(end, absence_end)
+        pieces.append({
+            **_attention_piece(segment, low, high),
+            "attention_state": "hard_idle",
+            "attention_weight": 0.0,
+            "annotation": label,
+        })
+        cursor = high
+    if not pieces:
+        return [segment]
+    if cursor < end:
+        pieces.append(_attention_piece(segment, cursor, end))
+    return pieces
+
+
+def _attention_piece(
+    segment: dict[str, object], start: datetime, end: datetime
+) -> dict[str, object]:
+    zone = datetime.fromisoformat(str(segment["started_at"])).tzinfo or timezone.utc
+    return {
+        **segment,
+        "started_at": start.astimezone(zone).isoformat(),
+        "ended_at": end.astimezone(zone).isoformat(),
+        "started_at_utc": start.isoformat(),
+        "ended_at_utc": end.isoformat(),
+        "duration_seconds": (end - start).total_seconds(),
+    }
 
 
 def summarize_attention(
@@ -186,18 +267,18 @@ def summarize_attention(
     attention_policy: AttentionPolicy | None = None,
 ) -> dict[str, object]:
     """Estimate attention-state time from keyboard/mouse idle samples."""
-    policy = attention_policy or AttentionPolicy()
+    activity_segments, attention_segments = day_segments(conn, day, attention_policy)
+    return summarize_attention_segments(activity_segments, attention_segments)
+
+
+def summarize_attention_segments(
+    activity_segments: list[dict[str, object]],
+    attention_segments: list[dict[str, object]],
+) -> dict[str, object]:
+    """``summarize_attention`` for segments the caller already has."""
     all_states = (*ATTENTION_STATES, UNKNOWN)
     totals = {state: 0.0 for state in all_states}
     effective_seconds = 0.0
-
-    raw_rows = _list_raw_activity_events(conn, day)
-    if raw_rows:
-        attention_segments = _derive_attention_segments(raw_rows, policy)
-        activity_segments = _derive_activity_segments(raw_rows)
-    else:
-        attention_segments = _list_archived_attention_segments(conn, day)
-        activity_segments = _list_archived_activity_segments(conn, day)
     for segment in attention_segments:
         state = str(segment["attention_state"])
         seconds = float(segment["duration_seconds"] or 0.0)

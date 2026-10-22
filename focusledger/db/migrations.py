@@ -7,7 +7,7 @@ from sqlite3 import Connection
 
 # The schema version lives in SQLite's own user_version header field. Each
 # step below runs once, in order, for databases older than its number.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 LOGGER = logging.getLogger(__name__)
 
@@ -419,7 +419,38 @@ def _ensure_column(conn: Connection, table: str, column: str, decl: str) -> None
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+def _migrate_v11(conn: Connection) -> None:
+    """Add user time annotations and the log of changes made on the user's behalf."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS time_annotations (
+            id TEXT PRIMARY KEY,
+            local_date TEXT NOT NULL,
+            started_at_utc TEXT NOT NULL,
+            ended_at_utc TEXT NOT NULL,
+            label TEXT NOT NULL,
+            note TEXT,
+            change_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_time_annotations_range
+            ON time_annotations(started_at_utc, ended_at_utc);
+        CREATE TABLE IF NOT EXISTS change_log (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            arguments TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            undo TEXT NOT NULL,
+            undone_at TEXT
+        );
+        """
+    )
+
+
 _STEPS = (
     (9, _baseline_v9),
     (10, _migrate_v10),
+    (11, _migrate_v11),
 )

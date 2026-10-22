@@ -99,6 +99,25 @@ class AppScriptTests(unittest.TestCase):
         self.assertIn('fetch("/api/report', self.src)                  # live mode
         self.assertIn("createRoot", self.src)
 
+    def test_analyst_questions_are_posted_as_json(self) -> None:
+        """The server refuses other content types; that refusal is the CSRF guard."""
+        self.assertIn('postJson("/api/analyst/ask"', self.src)
+        self.assertIn('postJson("/api/analyst/proposals/"', self.src)
+        self.assertIn('"Content-Type": "application/json"', self.src)
+        self.assertEqual(self.src.count('method: "POST"'), 1, "every POST should go through postJson")
+
+    def test_applied_changes_stay_undoable(self) -> None:
+        """A card unmounts when its run folds, so its status must not live in the card."""
+        card = self.src[self.src.index("function ProposalCard"):self.src.index("function ChangeLog")]
+        self.assertIn("var proposal = props.proposal;", card)
+        self.assertNotIn("useState(props.proposal)", card)
+        self.assertIn('fetch("/api/changes"', self.src)  # the list that outlives a reload
+
+    def test_model_answers_are_never_injected_as_html(self) -> None:
+        """Answers are model output; they are rendered as React elements only."""
+        self.assertNotIn("dangerouslySetInnerHTML", self.src)
+        self.assertNotIn("innerHTML", self.src)
+
     def test_brackets_balance(self) -> None:
         stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', self.src)
         stripped = re.sub(r"'(?:[^'\\]|\\.)*'", "''", stripped)

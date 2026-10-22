@@ -17,9 +17,10 @@ Resolution order follows the spec, most specific first:
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlite3 import Connection
 
 from focusledger.services.browser import parse_browser_context
@@ -60,6 +61,7 @@ CATEGORY_LABELS = {
 PRODUCTIVE_CATEGORIES = (PRODUCTIVE_CORE, LEARNING_GENERAL)
 DISTRACTING_CATEGORIES = (ENTERTAINMENT, GAMING, SOCIAL)
 
+MATCH_ANNOTATION = "annotation"
 MATCH_MANUAL = "manual"
 MATCH_DELIVERABLE = "deliverable"
 MATCH_LEARNED = "learned"
@@ -86,6 +88,7 @@ class Classification:
     def confidence(self) -> float:
         """How much to trust this label, by how specific the match was."""
         return {
+            MATCH_ANNOTATION: 1.0,
             MATCH_MANUAL: 1.0,
             MATCH_DELIVERABLE: 0.9,
             MATCH_LEARNED: 0.85,
@@ -318,7 +321,21 @@ def load_rule_context(conn: Connection) -> dict[str, object]:
             "SELECT id, title, match_keywords FROM deliverables WHERE status != 'archived'"
         ).fetchall()
     ]
-    return {"corrections": corrections, "learned": learned, "deliverables": deliverables}
+    try:
+        absences = [
+            (_utc(row[0]), _utc(row[1]), str(row[2]))
+            for row in conn.execute(
+                "SELECT started_at_utc, ended_at_utc, label FROM time_annotations"
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:  # a database from before v11
+        absences = []
+    return {
+        "corrections": corrections,
+        "learned": learned,
+        "deliverables": deliverables,
+        "absences": absences,
+    }
 
 
 def _match_deliverable(context: dict[str, object], process_name: str | None, title: str | None):
@@ -407,15 +424,25 @@ def classify(
 def classify_segments(
     segments: list[dict[str, object]], context: dict[str, object]
 ) -> list[dict[str, object]]:
-    """Attach a classification to each activity segment."""
+    """Attach a classification to each activity segment.
+
+    A segment that falls mostly inside a stretch the user marked as away is
+    idle whatever was in front: that is a stated fact about the time, so it
+    outranks every rule about the app.
+    """
+    absences = context.get("absences") or []
     out = []
     for segment in segments:
-        result = classify(
-            str(segment.get("process") or segment.get("process_name") or ""),
-            str(segment.get("title") or segment.get("window_title") or ""),
-            context,
-            executable_path=segment.get("executable_path"),  # type: ignore[arg-type]
-        )
+        label = _absence_label(segment, absences) if absences else None  # type: ignore[arg-type]
+        if label:
+            result = Classification(IDLE, MATCH_ANNOTATION, label)
+        else:
+            result = classify(
+                str(segment.get("process") or segment.get("process_name") or ""),
+                str(segment.get("title") or segment.get("window_title") or ""),
+                context,
+                executable_path=segment.get("executable_path"),  # type: ignore[arg-type]
+            )
         enriched = dict(segment)
         enriched["category"] = result.category
         enriched["matched_by"] = result.matched_by
@@ -424,6 +451,35 @@ def classify_segments(
         enriched["deliverable_id"] = result.deliverable_id
         out.append(enriched)
     return out
+
+
+def _absence_label(
+    segment: dict[str, object], absences: list[tuple[datetime, datetime, str]]
+) -> str | None:
+    """The absence label covering at least half of ``segment``, if any."""
+    start = _utc(segment.get("started_at_utc") or segment.get("started_at"))
+    end = _utc(segment.get("ended_at_utc") or segment.get("ended_at"))
+    if start is None or end is None:
+        return None
+    length = (end - start).total_seconds()
+    for absence_start, absence_end, label in absences:
+        if length <= 0:
+            if absence_start <= start < absence_end:
+                return label
+            continue
+        shared = (min(end, absence_end) - max(start, absence_start)).total_seconds()
+        if shared >= length / 2:
+            return label
+    return None
+
+
+def _utc(value: object) -> datetime | None:
+    moment = parse_moment(value)
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 def attach_attention_weight(

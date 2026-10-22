@@ -6,10 +6,9 @@ from pathlib import Path
 from sqlite3 import Connection
 
 from focusledger.services.activity import (
-    list_attention_segments,
-    list_timeline,
-    summarize_attention,
-    summarize_by_app,
+    day_segments,
+    summarize_attention_segments,
+    summarize_segments_by_app,
 )
 from focusledger.services.alerts import list_distractions
 from focusledger.services.attention import ATTENTION_STATES, UNKNOWN, AttentionPolicy
@@ -41,10 +40,11 @@ def build_report_data(
     policy = policy or AttentionPolicy()
     policy_config = config
 
-    attention_segments = list_attention_segments(conn, day, policy)
-    activity_segments = list_timeline(conn, day)
-    app_rows = summarize_by_app(conn, day)
-    attention_summary = summarize_attention(conn, day, poll_interval_seconds, policy)
+    # A recent day is derived from tens of thousands of raw samples; read and
+    # derive them once and build every view from the same segments.
+    activity_segments, attention_segments = day_segments(conn, day, policy)
+    app_rows = summarize_segments_by_app(activity_segments)
+    attention_summary = summarize_attention_segments(activity_segments, attention_segments)
 
     all_states = (*ATTENTION_STATES, UNKNOWN)
     totals = {
@@ -255,6 +255,7 @@ def _attention_segment(row: dict[str, object]) -> dict[str, object]:
         "max_idle_seconds": (
             None if row.get("max_idle_seconds") is None else float(row["max_idle_seconds"])
         ),
+        "annotation": row.get("annotation"),
         **_timezone_fields(row),
     }
 

@@ -10,9 +10,10 @@ from focusledger.config import build_default_config
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
 from focusledger.models import ActiveWindowSnapshot
-from focusledger.services import analyst
+from focusledger.services import analyst, changes
 from focusledger.services import llm as llm_service
-from focusledger.services.activity import record_activity_snapshot
+from focusledger.services.activity import list_attention_segments, record_activity_snapshot
+from focusledger.services.classify import add_correction
 
 STEAM_GAME = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Terraria\\Terraria.exe"
 
@@ -278,6 +279,100 @@ class LoopTests(AnalystFixture):
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0].answered)
         self.assertTrue(rows[0].used_expected_tool)
+
+
+class ChangeTests(AnalystFixture):
+    def annotations(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM time_annotations").fetchone()[0]
+
+    def test_marking_an_app_absent_waits_for_approval_and_can_be_undone(self) -> None:
+        ledger = analyst.Ledger(self.conn, self.config)
+        before = analyst.run_tool(ledger, "day_summary", {"date": "2026-07-20"})
+        proposal = analyst.run_tool(
+            ledger, "mark_absent", {"date": "2026-07-20", "label": "sleep", "app": "chrome.exe"}
+        )
+        self.assertEqual(proposal["status"], "awaiting_user_approval")
+        self.assertEqual(proposal["preview"]["stretches"], 1)
+        self.assertEqual(proposal["preview"]["marked_hours"], 0.2)
+        self.assertEqual(proposal["preview"]["effective_hours_before"], 0.7)
+        self.assertEqual(proposal["preview"]["effective_hours_after"], 0.5)
+        self.assertEqual(self.annotations(), 0)  # proposing writes nothing
+
+        change = changes.apply(self.conn, self.config, ledger.proposals[0])
+        after = self.tool("day_summary", date="2026-07-20")
+        self.assertEqual(self.annotations(), 1)
+        self.assertEqual(after["effective_hours"], 0.5)
+        self.assertEqual(
+            {row["app"]: row["category"] for row in after["top_apps"]}["chrome.exe"], "idle"
+        )
+        self.assertEqual(after["marked_absent"][0]["label"], "sleep")
+        states = {s.get("annotation") for s in list_attention_segments(
+            self.conn, datetime(2026, 7, 20, tzinfo=timezone.utc).date())}
+        self.assertIn("sleep", states)
+
+        changes.undo(self.conn, self.config, str(change["id"]))
+        restored = self.tool("day_summary", date="2026-07-20")
+        self.assertEqual(self.annotations(), 0)
+        self.assertEqual(restored["effective_hours"], before["effective_hours"])
+        self.assertNotIn("marked_absent", restored)
+        with self.assertRaises(changes.ChangeError):
+            changes.undo(self.conn, self.config, str(change["id"]))
+
+    def test_a_clock_range_can_run_past_midnight(self) -> None:
+        ledger = analyst.Ledger(self.conn, self.config)
+        proposal = analyst.run_tool(ledger, "mark_absent", {
+            "date": "2026-07-22", "label": "sleep", "start_time": "21:10", "end_time": "07:00",
+        })
+        start, end = ledger.proposals[0].arguments["ranges"][0]
+        self.assertEqual((start, end), ("2026-07-22T21:10:00+00:00", "2026-07-23T07:00:00+00:00"))
+        self.assertEqual(proposal["preview"]["effective_hours_after"], 0.2)
+
+        bad = analyst.run_tool(ledger, "mark_absent", {"date": "2026-07-22", "label": "nap"})
+        self.assertIn("label must be one of", bad["error"])
+
+    def test_a_category_change_restores_the_previous_correction_on_undo(self) -> None:
+        add_correction(self.conn, "dev", "process", "code.exe", "admin")
+        ledger = analyst.Ledger(self.conn, self.config)
+        proposal = analyst.run_tool(ledger, "correct_category", {
+            "scope": "process", "pattern": "Code.exe", "category": "productive_core",
+        })
+        self.assertEqual(proposal["preview"]["replaces_correction"], "admin")
+        self.assertEqual(proposal["preview"]["last_7_tracked_days"]["current_categories"], {"admin": 0.5})
+
+        change = changes.apply(self.conn, self.config, ledger.proposals[0])
+        self.assertEqual(self.correction(), "productive_core")
+        self.assertEqual(changes.list_changes(self.conn)[0]["id"], change["id"])
+        changes.undo(self.conn, self.config, str(change["id"]))
+        self.assertEqual(self.correction(), "admin")
+
+    def correction(self) -> str:
+        return self.conn.execute(
+            "SELECT category FROM manual_corrections WHERE scope = 'process' AND pattern = 'code.exe'"
+        ).fetchone()[0]
+
+    def test_analysis_collects_proposals_thinking_and_history_without_writing(self) -> None:
+        model = ScriptedModel(
+            {**tool_call("mark_absent", {"date": "2026-07-20", "label": "sleep", "app": "chrome.exe"}),
+             "thinking": "The user said chrome time was sleep."},
+            answer("已提议把 chrome.exe 的 0.2 小时标为睡觉，等你批准。"),
+        )
+        seen: list[str] = []
+        with mock.patch.object(llm_service, "chat", model), \
+                mock.patch.object(llm_service, "model_capabilities", return_value=("tools",)):
+            result = analyst.analyze(
+                self.conn, self.config, "那段是在睡觉，帮我标一下",
+                tool_mode="native",
+                history=[{"question": "7月20日 chrome 用了多久？", "answer": "0.2 小时。"}],
+                on_proposal=lambda p: seen.append(p.summary),
+            )
+
+        self.assertEqual(len(result.proposals), 1)
+        self.assertEqual(seen, [result.proposals[0].summary])
+        self.assertEqual(result.thinking, ["The user said chrome time was sleep."])
+        roles = [m["role"] for m in model.calls[0]["messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "user"])
+        self.assertEqual(result.ungrounded_numbers, [])
+        self.assertEqual(self.annotations(), 0)
 
 
 class GroundingTests(unittest.TestCase):

@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
 
 from focusledger.cli_support import ensure_initialized
 from focusledger.db.connection import connect
-from focusledger.services import analyst
+from focusledger.services import analyst, changes
 from focusledger.services import llm as llm_service
 
 
@@ -22,9 +23,19 @@ def register(subparsers) -> None:
     ask = sub.add_parser("ask", help="Answer one question with the local model and read-only tools.")
     ask.add_argument("question", help="For example: \"上周我的时间主要花在哪里？\"")
     ask.add_argument("--model", help="Ollama model (default: llm_analyst_model in config).")
-    ask.add_argument("--trace", action="store_true", help="Print each tool call as it happens.")
+    ask.add_argument("--trace", action="store_true",
+                     help="Print each tool call and the model's thinking as they happen.")
+    ask.add_argument("--yes", action="store_true",
+                     help="Apply changes the model proposes without asking.")
     _model_options(ask)
     ask.set_defaults(func=cmd_ask)
+
+    history = sub.add_parser("changes", help="List changes made on your behalf.")
+    history.set_defaults(func=cmd_changes)
+
+    undo = sub.add_parser("undo", help="Undo a change by its id.")
+    undo.add_argument("change_id")
+    undo.set_defaults(func=cmd_undo)
 
     evaluate = sub.add_parser("eval", help="Run a fixed question set against one or more models.")
     evaluate.add_argument("--models", help="Comma-separated models (default: the analyst model).")
@@ -81,7 +92,9 @@ def cmd_ask(args: argparse.Namespace) -> None:
         try:
             result = analyst.analyze(
                 conn, cfg, args.question, model=args.model,
-                on_tool_call=_print_call if args.trace else None, **_options(args),
+                on_tool_call=_print_call if args.trace else None,
+                on_thinking=_print_thinking if args.trace else None,
+                **_options(args),
             )
         except llm_service.LlmUnavailable as exc:
             raise SystemExit(f"error: {exc}")
@@ -100,6 +113,59 @@ def cmd_ask(args: argparse.Namespace) -> None:
             "-- warning: these numbers appear in no tool result, so the model may have "
             "computed or invented them: " + ", ".join(result.ungrounded_numbers)
         )
+    for proposal in result.proposals:
+        _confirm_and_apply(cfg, proposal, args.yes)
+
+
+def _confirm_and_apply(cfg, proposal: changes.Proposal, assume_yes: bool) -> None:
+    """Nothing the model proposes is written without a yes from the user."""
+    print()
+    print(f"Proposed change: {proposal.summary}")
+    for key, value in proposal.preview.items():
+        print(f"  {key}: {json.dumps(value, ensure_ascii=False)}")
+    approved = assume_yes
+    if not assume_yes:
+        try:
+            answer = input("Apply this change? [y/N] ") if sys.stdin.isatty() else None
+        except (EOFError, KeyboardInterrupt):
+            answer = None
+        if answer is None:
+            print("\nNot applied: no answer to read. Re-run with --yes to apply it.")
+            return
+        approved = answer.strip().lower() in ("y", "yes")
+    if not approved:
+        print("Not applied.")
+        return
+    with connect(cfg.database_path) as conn:
+        change = changes.apply(conn, cfg, proposal, source="cli")
+    print(f"Applied as change {change['id']}. Undo with: focusledger analyst undo {change['id']}")
+
+
+def _print_thinking(thought: str) -> None:
+    for line in thought.strip().splitlines():
+        print(f"  | {line}", flush=True)
+
+
+def cmd_changes(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    with connect(cfg.database_path) as conn:
+        rows = changes.list_changes(conn, limit=30)
+    if not rows:
+        print("No changes have been made on your behalf.")
+        return
+    for row in rows:
+        state = f"undone {row['undone_at']}" if row["undone_at"] else "active"
+        print(f"{row['id']}  {row['created_at']}  {row['source']:<8} {state:<28} {row['summary']}")
+
+
+def cmd_undo(args: argparse.Namespace) -> None:
+    cfg = ensure_initialized()
+    with connect(cfg.database_path) as conn:
+        try:
+            change = changes.undo(conn, cfg, args.change_id)
+        except changes.ChangeError as exc:
+            raise SystemExit(f"error: {exc}")
+    print(f"Undone: {change['summary']}")
 
 
 def _print_call(call: analyst.ToolCall) -> None:

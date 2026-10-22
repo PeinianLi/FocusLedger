@@ -236,3 +236,33 @@ CREATE TABLE IF NOT EXISTS daily_reviews (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_reviews_key ON daily_reviews(workday_key);
+
+-- Stretches the user says they were away from the computer (asleep, out,
+-- eating). A user fact, applied when segments are read: raw samples are never
+-- rewritten, so deleting the row restores the original reading.
+CREATE TABLE IF NOT EXISTS time_annotations (
+    id TEXT PRIMARY KEY,
+    local_date TEXT NOT NULL,
+    started_at_utc TEXT NOT NULL,
+    ended_at_utc TEXT NOT NULL,
+    label TEXT NOT NULL,
+    note TEXT,
+    change_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_time_annotations_range
+    ON time_annotations(started_at_utc, ended_at_utc);
+
+-- Every change written on the user's behalf (approved analyst proposals),
+-- with what it takes to undo it.
+CREATE TABLE IF NOT EXISTS change_log (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    action TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    undo TEXT NOT NULL,
+    undone_at TEXT
+);

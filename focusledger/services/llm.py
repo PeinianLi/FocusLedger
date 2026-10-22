@@ -53,6 +53,16 @@ def _same_model(candidate: str, wanted: str) -> bool:
     return candidate.split(":")[0] == wanted.split(":")[0] and ":" not in wanted
 
 
+def installed_models(config, timeout: float = 3.0) -> tuple[str, ...]:
+    """Names of the models pulled into the local endpoint."""
+    base_url = getattr(config, "llm_base_url", DEFAULT_BASE_URL).rstrip("/")
+    raw = _http_get(f"{base_url}/api/tags", timeout=timeout)
+    try:
+        return tuple(str(m["name"]) for m in json.loads(raw).get("models", []))
+    except (ValueError, KeyError, TypeError):
+        return ()
+
+
 def probe(config, timeout: float = 3.0) -> LlmStatus:
     """Check whether the local endpoint is reachable and the model is pulled."""
     base_url = getattr(config, "llm_base_url", DEFAULT_BASE_URL).rstrip("/")
@@ -60,14 +70,9 @@ def probe(config, timeout: float = 3.0) -> LlmStatus:
     if not getattr(config, "llm_enabled", False):
         return LlmStatus(False, base_url, model, detail="llm_enabled is false in config")
     try:
-        raw = _http_get(f"{base_url}/api/tags", timeout=timeout)
+        names = installed_models(config, timeout=timeout)
     except LlmUnavailable as exc:
         return LlmStatus(False, base_url, model, detail=str(exc))
-
-    try:
-        names = tuple(str(m["name"]) for m in json.loads(raw).get("models", []))
-    except (ValueError, KeyError, TypeError):
-        names = ()
 
     status = LlmStatus(True, base_url, model, names)
     if not status.model_installed:
