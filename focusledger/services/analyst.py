@@ -666,7 +666,9 @@ TOOLS: tuple[Tool, ...] = (
         "timeline",
         "What happened during one day, in order: blocks of continuous use of one "
         "app with start/end time, category, share of effective attention and the "
-        "main window title. Use from_time/to_time (HH:MM) to zoom in.",
+        "main window title. Use from_time/to_time (HH:MM) to zoom in. These blocks are "
+        "not focus blocks: a focus block is sustained attention across apps, and "
+        "day_summary returns those.",
         _params(
             ("date",),
             date=_DATE,
@@ -809,6 +811,7 @@ def analyze(
     on_tool_call: Callable[[ToolCall], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_proposal: Callable[[Proposal], None] | None = None,
+    execute: Callable[[Ledger, str, dict[str, object]], dict[str, object]] | None = None,
 ) -> AnalysisResult:
     """Let the local model answer ``question`` by calling the tools above.
 
@@ -817,6 +820,8 @@ def analyze(
     ``history`` holds earlier ``{"question", "answer"}`` turns of the same
     conversation, so a follow-up such as "mark that day" can be resolved.
     Write tools only add proposals to the result; nothing is written here.
+    ``execute`` stands in for ``run_tool``, for a caller that needs to see what
+    the model does when a tool misbehaves.
     Raises ``llm_service.LlmUnavailable`` when the model cannot be used.
     """
     model = model or analyst_model(config)
@@ -902,8 +907,13 @@ def analyze(
             tool_started = time.perf_counter()
             proposed = len(ledger.proposals)
             # A repeated read is served from cache; a repeated write proposal is not.
-            output = (seen.get(key) if name not in WRITE_TOOLS else None) or run_tool(ledger, name, arguments)
-            seen[key] = output
+            output = ((seen.get(key) if name not in WRITE_TOOLS else None)
+                      or (execute or run_tool)(ledger, name, arguments))
+            if "error" not in output:
+                # A call that failed is worth making again: remembering the
+                # error would hand the same failure back however often the
+                # model retried.
+                seen[key] = output
             for proposal in ledger.proposals[proposed:]:
                 result.proposals.append(proposal)
                 if on_proposal:

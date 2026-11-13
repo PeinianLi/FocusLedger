@@ -6,11 +6,16 @@ import argparse
 import json
 import statistics
 import sys
+import tempfile
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 from focusledger.cli_support import ensure_initialized
+from focusledger.config import load_config
 from focusledger.db.connection import connect
-from focusledger.services import analyst, changes
+from focusledger.db.migrations import apply_migrations
+from focusledger.services import analyst, bench, changes
 from focusledger.services import llm as llm_service
 
 
@@ -45,6 +50,37 @@ def register(subparsers) -> None:
     evaluate.add_argument("--out", help="Write every transcript to this JSON file.")
     _model_options(evaluate)
     evaluate.set_defaults(func=cmd_eval)
+
+    benchmark = sub.add_parser(
+        "bench",
+        help="Grade models on questions with known answers, using a synthetic ledger.",
+    )
+    benchmark.add_argument("--models", help="Comma-separated models (default: the analyst model).")
+    benchmark.add_argument("--language", choices=bench.LANGUAGES,
+                           help="Language of the questions and answers (default: the configured one).")
+    benchmark.add_argument("--seed", type=int, default=7,
+                           help="Seed of the synthetic ledger (default 7). The same seed gives the same cases.")
+    benchmark.add_argument("--category", action="append", choices=bench.CATEGORIES,
+                           help="Only run this category; may be given more than once.")
+    benchmark.add_argument("--limit", type=int, help="Only run the first N cases.")
+    benchmark.add_argument("--repeat", type=int, default=1,
+                           help="Run every case this many times, to see how often the outcome changes "
+                           "(default 1).")
+    benchmark.add_argument(
+        "--real", action="store_true",
+        help="Derive the cases from your own ledger instead of a synthetic one. Cases that need a "
+        "planted situation are left out, and the results are not comparable between people.",
+    )
+    benchmark.add_argument("--list", action="store_true",
+                           help="Print the cases with their checks and reference solutions; no model is run.")
+    benchmark.add_argument("--out", help="Write every transcript and grade to this JSON file.")
+    benchmark.add_argument(
+        "--regrade", metavar="FILE",
+        help="Grade the transcripts in a file written by --out again, with the current rules; no "
+        "model is run. The seed, language and repeat count are taken from the file.",
+    )
+    _model_options(benchmark)
+    benchmark.set_defaults(func=cmd_bench)
 
     tools = sub.add_parser("tools", help="List the tools the model can call.")
     tools.set_defaults(func=cmd_tools)
@@ -244,6 +280,149 @@ def _load_questions(path: Path) -> list[analyst.EvalQuestion]:
         ]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise SystemExit(f"error: cannot read questions from {path}: {exc}")
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    saved = _saved_run(args.regrade) if args.regrade else None
+    if saved:
+        # The transcripts answer the cases of one ledger, in one language.
+        args.real = saved["seed"] is None
+        args.seed = args.seed if args.real else int(saved["seed"])
+        args.language = str(saved["language"])
+        args.repeat = int(saved.get("repeat") or 1)
+    cfg = ensure_initialized() if args.real else load_config()
+    language = args.language or ("zh" if str(getattr(cfg, "language", "en")).startswith("zh") else "en")
+    with tempfile.TemporaryDirectory() as scratch:
+        if args.real:
+            run_cfg = replace(cfg, language=language)
+            fixtures = None
+        else:
+            # A ledger of its own, in a folder that is thrown away: the user's
+            # data is neither read nor written. Only the model settings are kept.
+            root = Path(scratch)
+            run_cfg = replace(
+                cfg, language=language, data_dir=root, device_id="bench",
+                database_path=root / "bench.sqlite3", log_path=root / "bench.log",
+            )
+        with closing(connect(run_cfg.database_path)) as conn:
+            if not args.real:
+                apply_migrations(conn)
+                print(f"Building the synthetic ledger (seed {args.seed}) ...", file=sys.stderr, flush=True)
+                fixtures = bench.build_synthetic_ledger(conn, args.seed)
+            cases = bench.build_cases(conn, run_cfg, fixtures)
+            if args.category:
+                cases = [case for case in cases if case.category in args.category]
+            if args.limit is not None:
+                cases = cases[: max(0, args.limit)]
+            if not cases:
+                raise SystemExit("error: no cases to run (the ledger has too little data, or the "
+                                 "filters left nothing)")
+            if args.list:
+                for case in cases:
+                    print(bench.describe(case, language))
+                    print()
+                print(f"{len(cases)} case(s).")
+                return
+            models = [m.strip() for m in (args.models or analyst.analyst_model(cfg)).split(",") if m.strip()]
+            source = "your own ledger" if args.real else f"synthetic ledger, seed {args.seed}"
+            print(f"{len(cases)} cases ({source}), language {language}")
+            print()
+            print(f"{'model':<20} {'case':<30} result  tools  fixes  seconds")
+            if saved:
+                rows, stale = bench.regrade(saved, cases)
+                for row in rows:
+                    _print_bench_row(row)
+                if stale:
+                    print(f"\n{len(stale)} transcript(s) not graded, their case is gone or asks something "
+                          f"else now: {', '.join(stale)}")
+            else:
+                rows = bench.run_bench(conn, run_cfg, models, cases, language=language,
+                                       repeat=args.repeat, on_row=_print_bench_row, **_options(args))
+
+    summaries = bench.summarize(rows)
+    for summary in summaries:
+        print()
+        _print_scorecard(summary)
+    if args.out:
+        Path(args.out).write_text(
+            json.dumps(
+                {"language": language, "seed": None if args.real else args.seed, "repeat": args.repeat,
+                 "summary": summaries, "rows": [row.to_json_dict() for row in rows]},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nTranscripts written to {args.out}")
+
+
+def _saved_run(path: str) -> dict[str, object]:
+    try:
+        saved = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(saved["rows"], list) or "seed" not in saved or "language" not in saved:
+            raise ValueError("not a file written by analyst bench --out")
+        return saved
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"error: cannot read the saved run {path}: {exc}")
+
+
+def _print_scorecard(summary: dict[str, object]) -> None:
+    """One model's totals, a line for each of the seven dimensions."""
+    def frac(pair) -> str:
+        return f"{pair[0]}/{pair[1]}"
+
+    def score(part: dict[str, object]) -> str:
+        return f"{part['passed']}/{part['checks']}"
+
+    dims: dict[str, dict[str, object]] = summary["dimensions"]  # type: ignore[assignment]
+    retrieval, evidence, process = dims["retrieval"], dims["evidence"], dims["process"]
+    stability, cost, security = dims["stability"], dims["cost"], dims["security"]
+    print(f"{summary['model']}: {summary['passed']}/{summary['cases']} cases passed "
+          f"({summary['tool_mode']} tool calls)")
+    print(f"  1 result     {score(dims['result']):>8}  figures, names and dates in the answer")
+    print(f"  2 retrieval  {score(retrieval):>8}  right tool {frac(retrieval['right_tool'])}, "
+          f"evidence fetched {frac(retrieval['evidence_fetched'])}")
+    print(f"  3 evidence   {score(evidence):>8}  every number grounded {frac(evidence['grounded'])}, "
+          f"key figure fetched and stated {frac(evidence['figure_fetched_and_stated'])}, "
+          f"{evidence['ungrounded_numbers']} ungrounded number(s)")
+    print(f"  4 process    {score(process):>8}  within call budget {frac(process['within_budget'])}, "
+          f"no failed calls {frac(process['no_failed_calls'])}, "
+          f"no rewrite needed {frac(process['no_rewrite_needed'])}, "
+          f"stopped normally {frac(process['stopped_normally'])}")
+    stable = (f"  5 stability  {stability['passed']}/{stability['cases']:<6}  "
+              f"same question reworded {frac(stability['wordings'])}, "
+              f"recovered from a failed call {frac(stability['recovered_from_failed_call'])}")
+    if stability["same_outcome_every_run"]:
+        stable += f", same outcome on every run {frac(stability['same_outcome_every_run'])}"
+    print(stable)
+    per_pass = cost["tokens_per_passed_case"]
+    print(f"  6 cost       {cost['prompt_tokens_per_case']:.0f} prompt + {cost['output_tokens_per_case']:.0f} "
+          f"output tokens per case, {'-' if per_pass is None else per_pass} tokens per passed case, "
+          f"median {cost['median_seconds']} s, {cost['rounds_per_case']} model rounds and "
+          f"{cost['tool_calls_per_case']} tool calls per case")
+    print(f"  7 security   {score(security):>8}  proposal, injection and permission cases "
+          f"{frac(security['cases'])}, {security['unasked_proposals']} unasked proposal(s), "
+          f"{security['database_writes']} database write(s)")
+    parts = ", ".join(f"{name} {done}/{total}" for name, (done, total) in summary["by_category"].items())  # type: ignore[union-attr]
+    print(f"  by category: {parts}")
+    if summary["errors"]:
+        print(f"  {summary['errors']} case(s) could not be run (model unavailable)")
+    if summary["wrote"]:
+        print(f"  WARNING: the database changed during {summary['wrote']} case(s)")
+
+
+def _print_bench_row(row: bench.BenchRow) -> None:
+    if row.result is None:
+        print(f"{row.model:<20} {row.case.id:<30} error: {row.error}", flush=True)
+        return
+    line = (
+        f"{row.model:<20} {row.case.id:<30} {'pass' if row.passed else 'FAIL':<6}"
+        f"{len(row.result.tool_calls):>6}{len(row.result.corrections):>7}{row.result.seconds:>9.0f}"
+    )
+    if not row.passed:
+        line += "  " + "; ".join(row.failures())
+    elif row.remarks():
+        line += "  (" + "; ".join(row.remarks()) + ")"
+    print(line, flush=True)
 
 
 def cmd_tools(args: argparse.Namespace) -> None:
