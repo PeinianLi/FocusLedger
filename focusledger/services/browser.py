@@ -51,6 +51,11 @@ _SITE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("claude.ai", re.compile(r"\bClaude\b", re.I)),
 ]
 
+
+def fingerprinted_sites() -> frozenset[str]:
+    """Sites recognised by a fixed fingerprint, not read out of the title text."""
+    return frozenset(site for site, _ in _SITE_PATTERNS)
+
 # A domain written into the title, e.g. "example.com/page — Firefox".
 # Captures a trailing slash so "docs.rs/tokio" can be told apart from "main.rs".
 _DOMAIN_IN_TITLE = re.compile(r"\b([a-z0-9-]+(?:\.[a-z0-9-]+)+)(/)?", re.I)

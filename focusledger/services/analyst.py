@@ -10,6 +10,7 @@ number in the answer that no tool returned.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections import Counter, defaultdict
@@ -63,11 +64,18 @@ class ToolError(ValueError):
 # --------------------------------------------------------------------------
 # per-run data access
 # --------------------------------------------------------------------------
+OTHER_SITE = "(other site)"
+
+
 @dataclass
 class DayFacts:
     date: str
     activity: list[dict[str, object]]
     attention: list[dict[str, object]]
+    # When set, only these sites are named; the rest are counted together as
+    # OTHER_SITE. A site outside the built-in list was read out of a window
+    # title, so naming it would hand over a piece of that title.
+    public_sites: frozenset[str] | None = None
 
     @property
     def recorded_seconds(self) -> float:
@@ -94,6 +102,8 @@ class DayFacts:
             name = segment.get(key)
             if not name:
                 continue
+            if key == "site" and self.public_sites is not None and name not in self.public_sites:
+                name = OTHER_SITE
             seconds = _seconds(segment)
             totals[str(name)][0] += seconds
             totals[str(name)][1] += seconds * float(segment.get("attention_weight") or 0.0)
@@ -116,9 +126,11 @@ def tracked_dates(conn: Connection) -> list[str]:
 class Ledger:
     """Tracked data for one analysis run; each day is computed at most once."""
 
-    def __init__(self, conn: Connection, config) -> None:
+    def __init__(self, conn: Connection, config,
+                 public_sites: frozenset[str] | None = None) -> None:
         self.conn = conn
         self.config = config
+        self.public_sites = public_sites
         self.policy = AttentionPolicy.from_config(config)
         self._rules = load_rule_context(conn)
         self._days: dict[str, DayFacts] = {}
@@ -139,7 +151,7 @@ class Ledger:
             activity, attention = day_segments(self.conn, date.fromisoformat(day), self.policy)
             classified = classify_segments(activity, self._rules)
             attach_attention_weight(classified, attention)
-            self._days[day] = DayFacts(day, classified, attention)
+            self._days[day] = DayFacts(day, classified, attention, self.public_sites)
         return self._days[day]
 
     def attention_tracked_from(self) -> str | None:
@@ -1407,20 +1419,23 @@ def _gaps(dates: list[str], start: str | None = None, end: str | None = None) ->
     """Untracked stretches as ``first..last`` strings."""
     if not dates:
         return []
-    have = set(dates)
-    day = date.fromisoformat(start or dates[0])
+    first = date.fromisoformat(start or dates[0])
     last = date.fromisoformat(end or dates[-1])
-    gaps, run = [], []
-    while day <= last:
-        if day.isoformat() in have:
-            if run:
-                gaps.append(f"{run[0]}..{run[-1]}")
-                run = []
-        else:
-            run.append(day.isoformat())
-        day += timedelta(days=1)
-    if run:
-        gaps.append(f"{run[0]}..{run[-1]}")
+    one_day = timedelta(days=1)
+    # Walk the tracked dates, not the calendar: the work is bounded by how much
+    # was recorded, however wide a range the caller asks about.
+    gaps: list[str] = []
+    cursor: date | None = first
+    for tracked in sorted({date.fromisoformat(d) for d in dates}):
+        if cursor is None or tracked > last:
+            break
+        if tracked < cursor:
+            continue
+        if tracked > cursor:
+            gaps.append(f"{cursor.isoformat()}..{(tracked - one_day).isoformat()}")
+        cursor = tracked + one_day if tracked < date.max else None
+    if cursor is not None and cursor <= last:
+        gaps.append(f"{cursor.isoformat()}..{last.isoformat()}")
     return gaps
 
 
@@ -1465,9 +1480,12 @@ def _date_arg(args: dict[str, object], key: str, required: bool) -> str | None:
 
 def _number(value: object, default: float) -> float:
     try:
-        return float(value) if value not in (None, "") else default
-    except (TypeError, ValueError):
+        number = float(value) if value not in (None, "") else default
+    except (TypeError, ValueError, OverflowError):
         return default
+    # "nan" and "inf" parse as floats but are not usable thresholds, and would
+    # come back out as tokens that are not valid JSON.
+    return number if math.isfinite(number) else default
 
 
 def _arguments(raw: object) -> dict[str, object]:

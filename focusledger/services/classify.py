@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlite3 import Connection
 
-from focusledger.services.browser import parse_browser_context
+from focusledger.services.browser import fingerprinted_sites, parse_browser_context
 from focusledger.timeutil import overlap_seconds, parse_moment
 
 PRODUCTIVE_CORE = "productive_core"
@@ -154,6 +154,15 @@ _SITE_RULES: dict[str, str] = {
     "youtube.com": ENTERTAINMENT,     # refined by title keywords below
     "bilibili.com": ENTERTAINMENT,
 }
+
+
+def well_known_sites() -> frozenset[str]:
+    """Public sites FocusLedger names by itself, safe to show where titles are not.
+
+    Every other "site" was read out of a window title, so it may be a file
+    name, an e-mail domain or an internal host rather than a public website.
+    """
+    return frozenset(_SITE_RULES) | fingerprinted_sites()
 
 # Title keywords that pull video sites toward learning, checked before the
 # site default so a lecture does not get filed as entertainment.

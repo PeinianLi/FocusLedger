@@ -4,6 +4,7 @@ from focusledger.commands import (
     analyst_cmd,
     classify_cmd,
     deliverable_cmd,
+    mcp_cmd,
     review_cmd,
     system_cmd,
     workday_cmd,
@@ -16,6 +17,7 @@ REGISTRARS = (
     review_cmd.register,
     system_cmd.register,
     analyst_cmd.register,
+    mcp_cmd.register,
 )
 
 __all__ = ["REGISTRARS"]
