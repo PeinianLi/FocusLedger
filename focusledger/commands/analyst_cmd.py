@@ -26,7 +26,7 @@ def register(subparsers) -> None:
     sub = parser.add_subparsers(required=True)
 
     ask = sub.add_parser("ask", help="Answer one question with the local model and read-only tools.")
-    ask.add_argument("question", help="For example: \"上周我的时间主要花在哪里？\"")
+    ask.add_argument("question", help="For example: \"Where did my time go last week?\"")
     ask.add_argument("--model", help="Ollama model (default: llm_analyst_model in config).")
     ask.add_argument("--trace", action="store_true",
                      help="Print each tool call and the model's thinking as they happen.")
