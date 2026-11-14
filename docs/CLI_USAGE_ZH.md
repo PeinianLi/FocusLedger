@@ -517,6 +517,7 @@ python -m focusledger analyst bench --repeat 3                               # �
 python -m focusledger analyst bench --list                                   # 列出题目、检查项和参考解，不运行模型
 python -m focusledger analyst bench --real                                   # 从你自己的数据导出题目
 python -m focusledger analyst bench --regrade bench.json                     # 对保存下来的记录重新判分，不运行模型
+python -m focusledger analyst bench --via-mcp                                # 经由 MCP 服务调用工具，和外部智能体的路径一样
 ```
 
 结果按七个维度报告：
@@ -567,9 +568,11 @@ python -m focusledger mcp tools                     # 列出对外提供的工�
 
 需要知道的几点：
 
+- **可选，由你决定。** 你不亲手把配置加进某个客户端，就不会有任何东西对外提供。FocusLedger 自己把数据留在本机，但使用云端模型的客户端会把每一条工具结果发给对应的服务商，而服务端无法分辨对面是哪一种客户端；`mcp config` 输出配置时会提示这一点。除非你能接受，否则请只接入使用本地模型的客户端。
 - **只读。** 只提供 8 个查询工具。`mark_absent` 和 `correct_category` 在 MCP 下不存在，因为修改必须由你在 FocusLedger 里批准。数据库文件以 SQLite 的只读模式打开：和其他命令不同，`mcp serve` 不会创建数据目录和数据库，也不会升级数据库。还没有数据库时，先运行 `python -m focusledger init`；如果工具提示数据库需要升级，运行一次 `python -m focusledger status` 即可。如果 `config.json` 读不出来，服务仍会启动，并由工具说明这一情况。SQLite 可能在数据库旁边创建它自己的 `-wal` 和 `-shm` 伴随文件，任何读取 WAL 模式数据库的程序都会如此；数据库文件本身不会被改动。
 - **默认不返回窗口标题。** 和 `analyst ask` 不同，MCP 客户端可能把工具结果发给云端模型。应用名、类别、时间，以及你自己给 deliverable 和任务起的名字会返回。网站只有在内置的知名网站列表里（YouTube、GitHub 等）才显示名字；其余网站的名字是从窗口标题里读出来的，所以统一计入 `(other site)`，也无法按名字查到，因此 `app_usage` 搜不到结果并不说明某个网站没被用过。加上 `--include-titles` 后，`timeline` 工具会返回窗口标题，所有网站也都显示名字。
 - **数据始终最新。** 每次调用都重新读数据库，记录了新活动之后不需要重启服务。
+- **用本地模型实测过。** `analyst bench --via-mcp` 让评测集里的工具调用经由这个服务（独立进程）完成，而不是在进程内直接调用。`qwen3.5:9b` 这样跑 35 题全过（2026-11-14）；必须以提案收尾的两道题不在其中，因为从外部无法提出修改。调用写入类工具会得到 `Unknown tool`，带有预埋指令的窗口标题也到不了模型那里。
 - 如果 FocusLedger 是从源码目录运行、没有安装成包，打印出的条目会带上 `PYTHONPATH`，这样客户端从任何目录都能启动它。
 - 服务启动时向 stderr 输出一行状态；stdout 只用于协议消息。
 

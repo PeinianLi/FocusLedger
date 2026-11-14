@@ -118,9 +118,11 @@ python -m focusledger mcp config   # prints the entry to paste into the client's
 python -m focusledger mcp tools    # lists what is served
 ```
 
+- **Optional, and your decision.** Nothing is served until you add the entry to a client yourself. FocusLedger keeps your data on this machine, but a client that uses a cloud model sends every tool result to that provider, and the server cannot tell which kind of client it is talking to; `mcp config` says so when it prints the entry. Connect a client that runs a local model unless you accept that.
 - **Read-only.** The two proposal tools are not served: a change needs your approval inside FocusLedger, and an outside client's model must not be the one to give it. The database file is opened in SQLite's read-only mode, so the server cannot create it, upgrade it or change a row; if there is no ledger yet, or it needs an upgrade, the tools say so instead. (SQLite may still create its own `-wal` and `-shm` companion files beside the database, as any reader of a WAL database does; the database file is never modified.)
 - **Window titles are withheld** unless you start the server with `--include-titles`. FocusLedger never sends data to a cloud model on its own, but an MCP client may, and titles are the most personal thing the tools return. That covers what is read out of a title as well: a site is named only if it is on the built-in list of well-known sites, and every other site is counted as `(other site)`, because without a browser extension a site name is a piece of title text.
 - **Stateless.** Every call opens the database and computes from scratch, so a long-running server always sees current data. It speaks the 2026-07-28 revision (per-request metadata and `server/discover`) as well as the `initialize` handshake of the revisions before it, using only the standard library.
+- **Tried with a local model.** `analyst bench --via-mcp` runs the benchmark with the tools reached through this server, in a separate process, instead of in-process. `qwen3.5:9b` passes 35 of 35 that way (2026-11-14); the two cases that must end in a proposal are left out, because nothing can be proposed from outside. A call to a write tool comes back as `Unknown tool`, and the window titles that carry planted instructions never reach the model.
 
 ## Live report
 

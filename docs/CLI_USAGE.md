@@ -511,6 +511,7 @@ python -m focusledger analyst bench --repeat 3                               # r
 python -m focusledger analyst bench --list                                   # print cases, checks and reference solutions; no model is run
 python -m focusledger analyst bench --real                                   # derive the cases from your own ledger
 python -m focusledger analyst bench --regrade bench.json                     # grade saved transcripts again; no model is run
+python -m focusledger analyst bench --via-mcp                                # reach the tools through the MCP server, as an outside agent would
 ```
 
 A run is reported along seven dimensions:
@@ -561,9 +562,11 @@ python -m focusledger mcp tools                     # list the tools that are se
 
 What to know:
 
+- **Optional, and your decision.** Nothing is served until you add the entry to a client yourself. FocusLedger keeps your data on this machine, but a client that uses a cloud model sends every tool result to that provider, and the server cannot tell which kind of client it is talking to; `mcp config` says so when it prints the entry. Connect a client that runs a local model unless you accept that.
 - **Read-only.** Only the eight read tools are served. `mark_absent` and `correct_category` do not exist over MCP, because a change needs your approval inside FocusLedger. The database file is opened in SQLite's read-only mode: unlike every other command, `mcp serve` never creates the data directory or the database and never upgrades it. If there is no ledger yet, run `python -m focusledger init` first; if a tool reports that the database needs an upgrade, run `python -m focusledger status` once. If `config.json` cannot be read, the server still starts and the tools report that. SQLite may create its own `-wal` and `-shm` companion files beside the database, as any reader of a WAL database does; the database file itself is never modified.
 - **Window titles are withheld by default.** Unlike `analyst ask`, an MCP client may send tool results to a cloud model. App names, categories, times and the names you gave your own deliverables and tasks are returned. Sites are named only when they are on the built-in list of well-known sites (YouTube, GitHub and the like); any other site was read out of a window title, so it is counted as `(other site)` and cannot be found by name, which means an `app_usage` search that finds nothing does not show that a site went unused. With `--include-titles` the `timeline` tool returns window titles and every site is named.
 - **Current data.** Every call reads the database afresh, so there is no need to restart the server after new activity is recorded.
+- **Tried with a local model.** `analyst bench --via-mcp` runs the benchmark with the tools reached through this server, in a separate process, instead of in-process. `qwen3.5:9b` passes 35 of 35 that way (2026-11-14); the two cases that must end in a proposal are left out, because nothing can be proposed from outside. A call to a write tool comes back as `Unknown tool`, and the window titles that carry planted instructions never reach the model.
 - The printed entry sets `PYTHONPATH` when FocusLedger runs from a source checkout rather than an installed package, so the client can start it from any directory.
 - The server writes one status line to stderr at startup; stdout carries protocol messages only.
 
