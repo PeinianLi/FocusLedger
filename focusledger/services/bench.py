@@ -967,15 +967,22 @@ def run_bench(
     language: str = "en",
     repeat: int = 1,
     on_row: Callable[[BenchRow], None] | None = None,
+    execute: Callable[[analyst.Ledger, str, dict[str, object]], dict[str, object]] | None = None,
     **options,
 ) -> list[BenchRow]:
-    """Run every case on every model, ``repeat`` times over, and grade each run."""
+    """Run every case on every model, ``repeat`` times over, and grade each run.
+
+    ``execute`` runs the tools in place of ``analyst.run_tool``; with an MCP
+    client's ``run_tool`` the model reaches them through the server, as an
+    outside agent would.
+    """
     rows: list[BenchRow] = []
     for model in models:
         for attempt in range(1, max(1, repeat) + 1):
             for case in cases:
                 before = _written_rows(conn)
-                faults = {"execute": _fails_once()} if case.fault == "first_call_fails" else {}
+                runner = _fails_once(execute) if case.fault == "first_call_fails" else execute
+                faults = {"execute": runner} if runner else {}
                 try:
                     result = analyst.analyze(
                         conn, config, case.text(language), model=model,
@@ -1038,16 +1045,26 @@ def _result_from_json(stored: dict[str, object]) -> analyst.AnalysisResult:
     )  # type: ignore[arg-type]
 
 
-def _fails_once() -> Callable[[analyst.Ledger, str, dict[str, object]], dict[str, object]]:
-    """A tool runner whose first call fails as a busy database would."""
+def _fails_once(inner=None) -> Callable[[analyst.Ledger, str, dict[str, object]], dict[str, object]]:
+    """A tool runner whose first call fails as a busy database would; later calls go to ``inner``."""
     pending = [TRANSIENT_ERROR]
 
     def execute(ledger: analyst.Ledger, name: str, arguments: dict[str, object]) -> dict[str, object]:
         if pending:
             return {"error": pending.pop()}
-        return analyst.run_tool(ledger, name, arguments)
+        return (inner or analyst.run_tool)(ledger, name, arguments)
 
     return execute
+
+
+def served_over_mcp(cases: list[Case]) -> list[Case]:
+    """The cases an outside agent can be asked: those that do not have to end in a proposal.
+
+    The MCP server offers the read tools only, so a change cannot be proposed
+    through it. A case that may also be turned down stays in: over MCP that is
+    the one right outcome.
+    """
+    return [case for case in cases if not any(check.kind == "proposal" for check in case.checks)]
 
 
 def summarize(rows: list[BenchRow]) -> list[dict[str, object]]:

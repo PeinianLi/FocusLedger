@@ -12,11 +12,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from focusledger.cli_support import ensure_initialized
-from focusledger.config import load_config
+from focusledger.config import build_default_config, load_config
 from focusledger.db.connection import connect
 from focusledger.db.migrations import apply_migrations
 from focusledger.services import analyst, bench, changes
 from focusledger.services import llm as llm_service
+from focusledger.services import mcp_client
 
 
 def register(subparsers) -> None:
@@ -74,6 +75,12 @@ def register(subparsers) -> None:
     benchmark.add_argument("--list", action="store_true",
                            help="Print the cases with their checks and reference solutions; no model is run.")
     benchmark.add_argument("--out", help="Write every transcript and grade to this JSON file.")
+    benchmark.add_argument(
+        "--via-mcp", action="store_true",
+        help="Reach the tools through FocusLedger's MCP server, as an outside agent would: the server "
+        "runs as a separate process on the benchmark's ledger and withholds what it withholds from any "
+        "client. It serves no write tools, so the cases that must end in a proposal are left out.",
+    )
     benchmark.add_argument(
         "--regrade", metavar="FILE",
         help="Grade the transcripts in a file written by --out again, with the current rules; no "
@@ -300,9 +307,12 @@ def cmd_bench(args: argparse.Namespace) -> None:
             # A ledger of its own, in a folder that is thrown away: the user's
             # data is neither read nor written. Only the model settings are kept.
             root = Path(scratch)
+            # The file names a fresh data directory would have, so that an MCP
+            # server pointed at this folder finds the ledger.
+            fresh = build_default_config(root)
             run_cfg = replace(
                 cfg, language=language, data_dir=root, device_id="bench",
-                database_path=root / "bench.sqlite3", log_path=root / "bench.log",
+                database_path=fresh.database_path, log_path=fresh.log_path,
             )
         with closing(connect(run_cfg.database_path)) as conn:
             if not args.real:
@@ -312,6 +322,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
             cases = bench.build_cases(conn, run_cfg, fixtures)
             if args.category:
                 cases = [case for case in cases if case.category in args.category]
+            if args.via_mcp and not saved:
+                cases = bench.served_over_mcp(cases)
             if args.limit is not None:
                 cases = cases[: max(0, args.limit)]
             if not cases:
@@ -335,6 +347,16 @@ def cmd_bench(args: argparse.Namespace) -> None:
                 if stale:
                     print(f"\n{len(stale)} transcript(s) not graded, their case is gone or asks something "
                           f"else now: {', '.join(stale)}")
+            elif args.via_mcp:
+                # The data has to be on disk for another process to read it.
+                conn.commit()
+                with mcp_client.start_server(None if args.real else run_cfg.data_dir) as client:
+                    served = [tool["name"] for tool in client.list_tools()]
+                    print(f"(tools reached through the MCP server, which serves {len(served)}: "
+                          f"{', '.join(served)})", file=sys.stderr, flush=True)
+                    rows = bench.run_bench(conn, run_cfg, models, cases, language=language,
+                                           repeat=args.repeat, on_row=_print_bench_row,
+                                           execute=client.run_tool, **_options(args))
             else:
                 rows = bench.run_bench(conn, run_cfg, models, cases, language=language,
                                        repeat=args.repeat, on_row=_print_bench_row, **_options(args))
@@ -347,6 +369,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
         Path(args.out).write_text(
             json.dumps(
                 {"language": language, "seed": None if args.real else args.seed, "repeat": args.repeat,
+                 "via_mcp": bool(args.via_mcp),
                  "summary": summaries, "rows": [row.to_json_dict() for row in rows]},
                 ensure_ascii=False, indent=2,
             ),

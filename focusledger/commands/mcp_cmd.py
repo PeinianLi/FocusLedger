@@ -18,6 +18,13 @@ _TITLES_HELP = (
     "Also return window titles and every site name. Off by default, because an MCP "
     "client may send tool results to a cloud model."
 )
+_CLIENT_WARNING = (
+    "Note: this gives the client's model read access to your tracked time. FocusLedger itself "
+    "keeps everything on this machine, but a client that uses a cloud model sends each tool "
+    "result to that provider, and the server cannot tell which kind of client it is talking to. "
+    "Connect a client that runs a local model unless you accept that. The server offers read "
+    "tools only; changes can be proposed only by the analyst inside FocusLedger."
+)
 _UNREADABLE_CONFIG = (
     "The FocusLedger configuration file could not be read. Fix or delete config.json "
     "in the FocusLedger data directory, then restart the MCP server."
@@ -155,6 +162,8 @@ def cmd_config(args: argparse.Namespace) -> None:
     if env:
         entry["env"] = env
     print(json.dumps({"mcpServers": {mcp.SERVER_NAME: entry}}, indent=2))
+    # On stderr, so the JSON on stdout can still be piped into a file.
+    _say(_CLIENT_WARNING)
 
 
 def _launch_env() -> dict[str, str]:
